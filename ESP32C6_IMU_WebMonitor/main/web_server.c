@@ -32,6 +32,8 @@ static esp_err_t file_handler(httpd_req_t *req);
 static void ws_register_connection(int fd);
 static void ws_unregister_connection(int fd);
 static esp_err_t ws_send_to_all(const char *data, size_t len);
+static void ws_broadcast_task(void *arg);
+static esp_err_t root_handler(httpd_req_t *req);
 
 // API Data endpoint - returns latest sensor data
 static esp_err_t api_data_handler(httpd_req_t *req)
@@ -279,35 +281,26 @@ static esp_err_t api_download_handler(httpd_req_t *req)
 // WebSocket data handler
 static esp_err_t ws_data_handler(httpd_req_t *req)
 {
+    // On initial GET upgrade, register the connection
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "WebSocket data connection request");
+        int fd = httpd_req_to_sockfd(req);
+        ws_register_connection(fd);
+        ESP_LOGI(TAG, "WebSocket connected fd=%d", fd);
         return ESP_OK;
     }
-    
-    // WebSocket frame handling
+
+    // For incoming messages (optional control), just consume and ack
     httpd_ws_frame_t ws_pkt;
-    uint8_t *buf = NULL;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-    
-    if (req->method == HTTP_POST) {
-        // Register connection
-        ws_register_connection(httpd_req_to_sockfd(req));
-        
-        // Send initial data
-        imu_data_t data;
-        if (data_buffer_get_latest(&data) == ESP_OK) {
-            char json_buffer[1024];
-            // TODO: Convert to JSON and send
-            ws_pkt.payload = (uint8_t*)json_buffer;
-            ws_pkt.len = strlen(json_buffer);
-            httpd_ws_send_frame(req, &ws_pkt);
-        }
-        
-        return ESP_OK;
+    if (httpd_ws_recv_frame(req, &ws_pkt, 0) == ESP_OK && ws_pkt.len) {
+        uint8_t tmp_buf[64];
+        ws_pkt.payload = tmp_buf;
+        size_t to_read = ws_pkt.len < sizeof(tmp_buf) ? ws_pkt.len : sizeof(tmp_buf);
+        httpd_ws_recv_frame(req, &ws_pkt, to_read);
+        // No-op; could parse control messages here
     }
-    
-    return ESP_FAIL;
+    return ESP_OK;
 }
 
 // WebSocket control handler
@@ -407,11 +400,15 @@ static void ws_unregister_connection(int fd)
 
 static esp_err_t ws_send_to_all(const char *data, size_t len)
 {
-    if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    httpd_ws_frame_t frame = {
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)data,
+        .len = len
+    };
+    if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
             if (ws_connections[i].active) {
-                // TODO: Send WebSocket frame to connection
-                // This would require implementing WebSocket frame sending
+                httpd_ws_send_frame_async(server, ws_connections[i].fd, &frame);
             }
         }
         xSemaphoreGive(ws_mutex);
@@ -476,7 +473,26 @@ esp_err_t web_server_start(void)
         };
         httpd_register_uri_handler(server, &api_download_uri);
         
-        // File handler for static content
+        // Root handler serves an embedded dashboard when SPIFFS is not populated
+        httpd_uri_t root_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &root_uri);
+
+        // WebSocket endpoint for realtime data
+        httpd_uri_t ws_data_uri = {
+            .uri = WS_DATA_PATH,
+            .method = HTTP_GET,
+            .handler = ws_data_handler,
+            .user_ctx = NULL,
+            .is_websocket = true
+        };
+        httpd_register_uri_handler(server, &ws_data_uri);
+
+        // File handler for static content under /spiffs
         httpd_uri_t file_uri = {
             .uri = "/*",
             .method = HTTP_GET,
@@ -486,6 +502,8 @@ esp_err_t web_server_start(void)
         httpd_register_uri_handler(server, &file_uri);
         
         ESP_LOGI(TAG, "Web server started successfully");
+        // Start broadcaster task (50 Hz)
+        xTaskCreatePinnedToCore(ws_broadcast_task, "ws_broadcast", 4096, NULL, 4, NULL, 0);
         return ESP_OK;
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -521,8 +539,12 @@ esp_err_t web_server_broadcast_stats(const char *stats, size_t len)
 
 esp_err_t websocket_send_data(httpd_handle_t hd, int fd, const char *data, size_t len)
 {
-    // TODO: Implement WebSocket frame sending
-    return ESP_OK;
+    httpd_ws_frame_t frame = {
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)data,
+        .len = len
+    };
+    return httpd_ws_send_frame_async(hd, fd, &frame);
 }
 
 esp_err_t websocket_send_json(httpd_handle_t hd, int fd, const char *json_data)
@@ -543,4 +565,45 @@ esp_err_t web_server_set_fifo_watermark(uint16_t watermark)
 esp_err_t web_server_enable_sensor(uint8_t sensor_id, bool enable)
 {
     return imu_manager_enable_sensor(sensor_id, enable);
+}
+
+// Broadcast latest sample periodically as compact JSON
+static void ws_broadcast_task(void *arg)
+{
+    (void)arg;
+    char json[512];
+    for (;;) {
+        imu_data_t d;
+        if (data_buffer_get_latest(&d) == ESP_OK) {
+            // Build compact JSON manually to reduce overhead
+            int n = 0;
+            n += snprintf(json + n, sizeof(json) - n, "{\"t\":%llu", (unsigned long long)d.timestamp_us);
+            if (d.accelerometer.valid) {
+                n += snprintf(json + n, sizeof(json) - n, ",\"acc\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}",
+                              d.accelerometer.x_g, d.accelerometer.y_g, d.accelerometer.z_g);
+            }
+            if (d.imu_6axis.valid) {
+                n += snprintf(json + n, sizeof(json) - n, ",\"gyr\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f}",
+                              d.imu_6axis.gyro_x_dps, d.imu_6axis.gyro_y_dps, d.imu_6axis.gyro_z_dps);
+            }
+            n += snprintf(json + n, sizeof(json) - n, "}");
+            ws_send_to_all(json, n);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20)); // ~50 Hz
+    }
+}
+
+// Simple embedded HTML dashboard (served at "/")
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    static const char *html =
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>HBQ-IMU-C6 Realtime</title>"
+        "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>"
+        "<style>body{font-family:sans-serif;margin:16px}canvas{max-width:960px;width:100%}</style>"
+        "</head><body><h3>Realtime Accelerometer (g)</h3><canvas id=acc></canvas>"
+        "<script>const ctx=document.getElementById('acc');const chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'Ax',data:[],borderColor:'#e74c3c',tension:.1},{label:'Ay',data:[],borderColor:'#27ae60',tension:.1},{label:'Az',data:[],borderColor:'#2980b9',tension:.1}]},options:{animation:false,parsing:false,scales:{x:{display:false}}}});"
+        "const ws=new WebSocket(`ws://${location.host}/ws/data`);const maxP=500;ws.onmessage=(ev)=>{try{const m=JSON.parse(ev.data);if(m.acc){const t=(m.t/1000)|0;chart.data.labels.push(t);chart.data.datasets[0].data.push(m.acc.x);chart.data.datasets[1].data.push(m.acc.y);chart.data.datasets[2].data.push(m.acc.z);if(chart.data.labels.length>maxP){chart.data.labels.shift();chart.data.datasets.forEach(ds=>ds.data.shift())}chart.update('none');}}catch(e){}};"
+        "</script></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }

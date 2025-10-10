@@ -34,8 +34,8 @@ A high-performance web-based monitoring system for multiple IMU sensors with rea
 
 1. **Clone and setup**:
 ```bash
-git clone https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module.git
-cd ESP32_Vibra_Accel_inclio_Module/ESP32C6_IMU_WebMonitor
+git clone https://github.com/hbqtechnologycompany/ESP32-C6-Multi-Sensor-IMU-Module.git
+cd ESP32-C6-Multi-Sensor-IMU-Module/ESP32C6_IMU_WebMonitor
 ```
 
 2. **Configure WiFi**:
@@ -62,6 +62,7 @@ Open browser and navigate to the ESP32's IP address (check serial monitor for IP
 - **Data Statistics**: Performance metrics and buffer statistics
 - **Configuration Panel**: Remote sensor configuration
 - **Data Export**: Download data in CSV or JSON format
+- **WebSocket Streaming**: Low-latency push via `ws://<device-ip>/ws/data`
 
 ### API Endpoints
 
@@ -70,6 +71,14 @@ Open browser and navigate to the ESP32's IP address (check serial monitor for IP
 - `GET /api/stats` - Get buffer and performance statistics
 - `GET /api/download?format=csv` - Download data as CSV
 - `GET /api/download?format=json` - Download data as JSON
+
+#### Realtime Streaming
+- `WS /ws/data` - WebSocket endpoint publishing compact JSON frames at ~50 Hz
+
+Example message:
+```json
+{"t": 1234567890, "acc": {"x": 0.01, "y": -0.02, "z": 0.98}, "gyr": {"x": 0.1, "y": 0.0, "z": -0.1}}
+```
 
 #### Configuration
 - `GET /api/config` - Get current configuration
@@ -170,6 +179,13 @@ int64_t start_time = esp_timer_get_time();
 int64_t end_time = esp_timer_get_time();
 ESP_LOGI("PERF", "Operation took %lld us", end_time - start_time);
 ```
+
+## 🚀 Quick Start for Web Dashboard
+
+1. Flash firmware and connect ESP32-C6 to your WiFi.
+2. Open a browser and navigate to `http://<device-ip>/`.
+3. The built-in HTML/JS dashboard (served from firmware) will render a realtime accelerometer chart using WebSocket.
+4. Advanced UI can be served from SPIFFS by uploading your own `index.html` to `/spiffs`.
 
 ## 🛠️ Troubleshooting
 
