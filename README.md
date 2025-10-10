@@ -1,4 +1,4 @@
-# ESP32-C6 IMU Measurement Module
+# ESP32-C6 Multi Sensor IMU Measurement Module
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -203,8 +203,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact
 
-- **Issues**: [GitHub Issues](https://github.com/hbqtechnologycompany/ESP32_Vibra_Accel_inclio_Module/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/hbqtechnologycompany/ESP32_Vibra_Accel_inclio_Module/discussions)
+- **Issues**: [GitHub Issues](https://github.com/hbqtechnologycompany/ESP32-C6-Multi-Sensor-IMU-Module/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/hbqtechnologycompany/ESP32-C6-Multi-Sensor-IMU-Module/discussions)
 - **Email**: hbqsolution@gmail.com
 
 ---
