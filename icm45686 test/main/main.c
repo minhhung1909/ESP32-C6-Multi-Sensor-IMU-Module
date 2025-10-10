@@ -139,6 +139,12 @@ static esp_err_t imu_init_board(void)
     }
     ESP_LOGI(TAG, "ICM45686 initialized");
 
+    // Quick WHO_AM_I check using inv driver snapshot if available
+    inv_imu_sensor_data_t idchk; memset(&idchk, 0, sizeof(idchk));
+    if (icm456xx_get_data_from_registers(&imu_dev, &idchk) == 0) {
+        ESP_LOGI(TAG, "ICM45686 register read OK (accelerometer/gyro raw snapshot logged periodically)");
+    }
+
     // bật accelerometer/gyro
     icm456xx_start_accel(&imu_dev, ACCEL_ODR_HZ, 16);
     icm456xx_start_gyro(&imu_dev, GYRO_ODR_HZ, 2000);

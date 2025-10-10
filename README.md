@@ -1,5 +1,7 @@
 # ESP32-C6 Multi Sensor IMU Measurement Module
 
+> [VI] Mô-đun đo IMU đa cảm biến trên ESP32‑C6 với giám sát WebSocket realtime và BLE (tùy chọn). Hỗ trợ IIS2MDC (từ kế), IIS3DWB (gia tốc tốc độ cao), ICM45686 (IMU 6 trục), SCL3300 (inclinometer). Các mục song ngữ có nhãn [VI].
+
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.4-blue.svg)](https://docs.espressif.com/projects/esp-idf/en/latest/)
@@ -12,6 +14,8 @@ A comprehensive high-quality IMU measurement system with web-based monitoring ca
 ![ESP32-C6-Multi-Sensor-IMU-Module](https://github.com/user-attachments/assets/25552b5a-b936-4bbb-9c8f-0b7d65bbd243)
 
 ## 🎯 Features
+
+[VI] Tính năng
 
 - **Multi-Sensor Support**: IIS2MDC (Magnetometer), IIS3DWB (High-speed Accelerometer), ICM45686 (6-axis IMU), SCL3300 (Inclinometer)
 - **High-Speed Data Collection**: Up to 26.7kHz sampling rate
@@ -31,6 +35,8 @@ A comprehensive high-quality IMU measurement system with web-based monitoring ca
 | SCL3300 | Inclinometer | SPI | 1kHz | CRC protection, 4 modes |
 
 ## 🚀 Quick Start
+
+[VI] Bắt đầu nhanh
 
 ### Prerequisites
 - ESP-IDF v5.4 or later
@@ -64,6 +70,8 @@ idf.py flash monitor
 
 ## 📁 Project Structure
 
+[VI] Cấu trúc dự án
+
 ```
 ESP32-C6-Multi-Sensor-IMU-Module/
 ├── ESP32C6_IIS2MDC/          # Magnetometer example
@@ -77,6 +85,8 @@ ESP32-C6-Multi-Sensor-IMU-Module/
 
 ## 🌐 Web Monitoring Interface
 
+[VI] Giao diện giám sát Web
+
 The web monitoring system provides:
 - **Real-time Data Visualization**: Live charts and graphs
 - **REST API**: JSON endpoints for data access
@@ -86,12 +96,16 @@ The web monitoring system provides:
 
 ### API Endpoints
 
+[VI] API chính
+
 - `GET /api/data` - Latest sensor data
 - `GET /api/stats` - Buffer statistics
 - `POST /api/config` - Configuration changes
 - `GET /api/download?format=csv` - Data export
 
 ## 🔧 Configuration
+
+[VI] Cấu hình
 
 ### GPIO Configuration
 
@@ -112,12 +126,16 @@ Update WiFi credentials in `main.c`:
 
 ## 📈 Performance Optimization
 
+[VI] Tối ưu hiệu năng
+
 - **DMA Usage**: All SPI transactions use DMA for maximum throughput
 - **FIFO Management**: Smart watermark configuration prevents overflow
 - **Task Priorities**: Optimized FreeRTOS task scheduling
 - **Memory Management**: Efficient buffer management with circular buffers
 
 ## 🎯 Applications
+
+[VI] Ứng dụng
 
 ### Industrial Monitoring
 - Vibration analysis for machinery
@@ -135,6 +153,8 @@ Update WiFi credentials in `main.c`:
 - Machine learning training data
 
 ## 🔧 Troubleshooting
+
+[VI] Xử lý sự cố
 
 ### Common Issues
 
@@ -160,12 +180,16 @@ Update WiFi credentials in `main.c`:
 
 ## 📚 Documentation
 
+[VI] Tài liệu
+
 - [Detailed Guide](DETAILED_GUIDE.md) - Comprehensive setup and usage guide
 - [API Documentation](docs/API.md) - REST API reference
 - [Hardware Guide](docs/HARDWARE.md) - PCB and wiring information
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
 
 ## 🤝 Contributing
+
+[VI] Đóng góp
 
 We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
@@ -178,9 +202,13 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ## 📄 License
 
+[VI] Giấy phép
+
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 💰 Support & Purchase
+
+[VI] Hỗ trợ & Mua hàng
 
 ### Buy ESP32-C6-Multi-Sensor-IMU-Module
 **Order Link**: [HBQ Technology Store](https://store.hbqsolution.com/?product=esp32-c6-multi-sensor-imu-module)

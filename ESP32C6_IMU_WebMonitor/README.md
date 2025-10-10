@@ -1,8 +1,12 @@
 # ESP32-C6 IMU Web Monitor
 
+> [VI] Ứng dụng web giám sát IMU realtime trên ESP32‑C6. Dashboard HTML/JS tích hợp, stream dữ liệu qua WebSocket `/ws/data`. Các mục song ngữ có nhãn [VI].
+
 A high-performance web-based monitoring system for multiple IMU sensors with real-time data visualization and control capabilities.
 
 ## 🌟 Features
+
+[VI] Tính năng
 
 - **Real-time Web Interface**: Live data visualization with charts and graphs
 - **Multi-Sensor Support**: Simultaneous monitoring of 4 different IMU sensors
@@ -23,6 +27,8 @@ A high-performance web-based monitoring system for multiple IMU sensors with rea
 | SCL3300 | Inclinometer | 1kHz | CRC protection, 4 modes |
 
 ## 🚀 Quick Start
+
+[VI] Bắt đầu nhanh
 
 ### Prerequisites
 - ESP-IDF v5.4 or later
@@ -56,6 +62,8 @@ Open browser and navigate to the ESP32's IP address (check serial monitor for IP
 
 ## 🌐 Web Interface
 
+[VI] Giao diện Web
+
 ### Dashboard Features
 - **Real-time Charts**: Live visualization of sensor data
 - **Multi-sensor Display**: Simultaneous monitoring of all sensors
@@ -65,6 +73,8 @@ Open browser and navigate to the ESP32's IP address (check serial monitor for IP
 - **WebSocket Streaming**: Low-latency push via `ws://<device-ip>/ws/data`
 
 ### API Endpoints
+
+[VI] API
 
 #### Data Access
 - `GET /api/data` - Get latest sensor readings
@@ -99,6 +109,8 @@ Example configuration update:
 ```
 
 ## 🔧 Configuration
+
+[VI] Cấu hình
 
 ### Hardware Configuration
 
@@ -144,6 +156,8 @@ Update GPIO pins in `main/main.c` if needed:
 
 ## 📊 Performance Optimization
 
+[VI] Tối ưu hiệu năng
+
 ### High-Speed Data Collection
 - **DMA Usage**: All SPI transactions use DMA
 - **FIFO Management**: Smart watermark configuration
@@ -157,6 +171,8 @@ Update GPIO pins in `main/main.c` if needed:
 - **WebSocket**: Real-time data streaming
 
 ## 🔍 Monitoring and Debugging
+
+[VI] Giám sát & Gỡ lỗi
 
 ### Built-in Statistics
 - Total samples collected
@@ -181,6 +197,8 @@ ESP_LOGI("PERF", "Operation took %lld us", end_time - start_time);
 ```
 
 ## 🚀 Quick Start for Web Dashboard
+
+[VI] Bắt đầu nhanh với Dashboard Web
 
 1. Flash firmware and connect ESP32-C6 to your WiFi.
 2. Open a browser and navigate to `http://<device-ip>/`.
