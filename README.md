@@ -9,6 +9,7 @@
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/hbqtechnologycompany?style=social)](https://github.com/sponsors/hbqtechnologycompany)
 
 A comprehensive high-quality IMU measurement system with web-based monitoring capabilities, featuring multiple sensors for various applications.
+![ESP32-C6-Multi-Sensor-IMU-Module](https://github.com/user-attachments/assets/25552b5a-b936-4bbb-9c8f-0b7d65bbd243)
 
 ## 🎯 Features
 
