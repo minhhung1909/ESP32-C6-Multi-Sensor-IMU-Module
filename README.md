@@ -203,9 +203,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact
 
-- **Issues**: [GitHub Issues](https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module/discussions)
-- **Email**: your-email@example.com
+- **Issues**: [GitHub Issues](https://github.com/hbqtechnologycompany/ESP32_Vibra_Accel_inclio_Module/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/hbqtechnologycompany/ESP32_Vibra_Accel_inclio_Module/discussions)
+- **Email**: hbqsolution@gmail.com
 
 ---
 
