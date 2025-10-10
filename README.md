@@ -181,8 +181,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 💰 Support & Purchase
 
-### Buy the CM5 Gateway Kit
-**Store**: [HBQ Technology Store](https://store.hbqsolution.com/)
+### Buy ESP32-C6-Multi-Sensor-IMU-Module
+**Order Link**: [HBQ Technology Store](https://store.hbqsolution.com/?product=esp32-c6-multi-sensor-imu-module)
 
 **Contact Information**:
 - Email: contact@hbqsolution.com | hbqsolution@gmail.com
