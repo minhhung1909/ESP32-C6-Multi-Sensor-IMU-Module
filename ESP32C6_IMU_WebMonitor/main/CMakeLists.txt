@@ -1,0 +1,10 @@
+idf_component_register(SRCS "main.c" 
+                              "web_server.c" 
+                              "imu_manager.c"
+                              "data_buffer.c"
+                              "sensors/iis2mdc.c"
+                              "sensors/iis3dwb.c" 
+                              "sensors/icm45686.c"
+                              "sensors/scl3300.c"
+                    INCLUDE_DIRS "." "sensors"
+                    REQUIRES esp_http_server esp_wifi nvs_flash spiffs)
