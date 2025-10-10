@@ -40,8 +40,8 @@ A comprehensive high-quality IMU measurement system with web-based monitoring ca
 
 1. **Clone the repository**:
 ```bash
-git clone https://github.com/YOUR_USERNAME/ESP32_Vibra_Accel_inclio_Module.git
-cd ESP32_Vibra_Accel_inclio_Module
+git clone https://github.com/hbqtechnologycompany/ESP32-C6-Multi-Sensor-IMU-Module.git
+cd ESP32-C6-Multi-Sensor-IMU-Module
 ```
 
 2. **Set up ESP-IDF**:
@@ -64,7 +64,7 @@ idf.py flash monitor
 ## 📁 Project Structure
 
 ```
-ESP32_Vibra_Accel_inclio_Module/
+ESP32-C6-Multi-Sensor-IMU-Module/
 ├── ESP32C6_IIS2MDC/          # Magnetometer example
 ├── ESP32C6_IIS3DWBTR/        # High-speed accelerometer example
 ├── icm45686/                 # 6-axis IMU with APEX features
