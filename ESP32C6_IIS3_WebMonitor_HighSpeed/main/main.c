@@ -20,8 +20,8 @@
 static const char *TAG = "MAIN";
 
 // WiFi credentials - change these for your network
-#define WIFI_SSID                   "Titan"
-#define WIFI_PASS                   "stm32f103rd"
+#define WIFI_SSID                   "your_SSID"
+#define WIFI_PASS                   "your_Password"
 #define WIFI_MAXIMUM_RETRY          5
 
 // Task priorities
