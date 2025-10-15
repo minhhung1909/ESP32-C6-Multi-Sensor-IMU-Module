@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "imu_manager.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 // Buffer configuration
 #define DATA_BUFFER_SIZE 1000  // Number of samples to keep in buffer

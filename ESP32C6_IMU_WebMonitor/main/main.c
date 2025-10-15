@@ -19,19 +19,19 @@
 static const char *TAG = "MAIN";
 
 // WiFi credentials - change these for your network
-#define WIFI_SSID      "YOUR_WIFI_SSID"
-#define WIFI_PASS      "YOUR_WIFI_PASSWORD"
-#define WIFI_MAXIMUM_RETRY  5
+#define WIFI_SSID                   "Titan"
+#define WIFI_PASS                   "stm32f103rd"
+#define WIFI_MAXIMUM_RETRY          5
 
 // Task priorities
-#define IMU_TASK_PRIORITY       5
-#define WEB_SERVER_TASK_PRIORITY 4
-#define DATA_PROCESSOR_PRIORITY  3
+#define IMU_TASK_PRIORITY           5
+#define WEB_SERVER_TASK_PRIORITY    4
+#define DATA_PROCESSOR_PRIORITY     3
 
 // Task stack sizes
-#define IMU_TASK_STACK_SIZE     8192
-#define WEB_SERVER_TASK_STACK_SIZE 4096
-#define DATA_PROCESSOR_STACK_SIZE  4096
+#define IMU_TASK_STACK_SIZE         8192
+#define WEB_SERVER_TASK_STACK_SIZE  4096
+#define DATA_PROCESSOR_STACK_SIZE   4096
 
 static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
@@ -136,13 +136,26 @@ static void imu_task(void *pvParameters)
     
     imu_data_t sensor_data;
     TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(10); // 100Hz sampling
+    const TickType_t frequency = pdMS_TO_TICKS(100); // 10Hz sampling (reduced from 100Hz to avoid watchdog)
+    uint32_t read_count = 0;
     
     while (1) {
         // Collect data from all sensors
         if (imu_manager_read_all(&sensor_data) == ESP_OK) {
             // Add to circular buffer
             data_buffer_add(&sensor_data);
+            read_count++;
+            
+            // printf("time(us): %lld, ii3s: x:%f - y:%f - z:%f - valid:%d \r\n", 
+            //     sensor_data.timestamp_us ,sensor_data.accelerometer.x_g, sensor_data.accelerometer.y_g, sensor_data.accelerometer.z_g, sensor_data.accelerometer.valid);
+            // Log every 100 reads
+            if (read_count % 100 == 0) {
+                ESP_LOGI(TAG, "IMU read count: %lu, buffer adds: %lu, mag_valid=%d", 
+                         read_count, read_count,
+                         sensor_data.magnetometer.valid);
+            }
+        } else {
+            ESP_LOGW(TAG, "Failed to read IMU data");
         }
         
         // Maintain precise timing
@@ -159,8 +172,9 @@ static void data_processor_task(void *pvParameters)
     uint32_t processed_count = 0;
     
     while (1) {
-        // Process data from buffer
-        if (data_buffer_get(&data) == ESP_OK) {
+        // Process data from buffer (use get_latest to not consume/delete data)
+        // This allows ws_broadcast_task to also read the same data
+        if (data_buffer_get_latest(&data) == ESP_OK) {
             // Calculate statistics, apply filters, etc.
             processed_count++;
             
@@ -168,9 +182,13 @@ static void data_processor_task(void *pvParameters)
             if (processed_count % 1000 == 0) {
                 ESP_LOGI(TAG, "Processed %lu samples", processed_count);
             }
+        } else {
+            // Buffer empty, wait longer to avoid busy-waiting
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
         
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // Always yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(100)); // Process at 10Hz, same as IMU sampling rate
     }
 }
 
@@ -234,8 +252,9 @@ void app_main(void)
     wifi_init_sta();
     
     // Create tasks
+    // ESP32-C6 is single-core, use core 0 or tskNO_AFFINITY
     xTaskCreatePinnedToCore(imu_task, "imu_task", IMU_TASK_STACK_SIZE, 
-                           NULL, IMU_TASK_PRIORITY, NULL, 1);
+                           NULL, IMU_TASK_PRIORITY, NULL, 0);
     
     xTaskCreatePinnedToCore(data_processor_task, "data_processor", 
                            DATA_PROCESSOR_STACK_SIZE, NULL, 

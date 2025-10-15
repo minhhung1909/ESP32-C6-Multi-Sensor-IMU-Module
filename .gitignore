@@ -1,0 +1,4 @@
+.vscode
+ESP32C6_IMU_WebMonitor/build
+ESP32C6_IMU_WebMonitor/sdkconfig.old
+program

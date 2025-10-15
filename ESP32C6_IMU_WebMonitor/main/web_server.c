@@ -400,6 +400,9 @@ static void ws_unregister_connection(int fd)
 
 static esp_err_t ws_send_to_all(const char *data, size_t len)
 {
+    static uint32_t total_sends = 0;
+    int active_connections = 0;
+    
     httpd_ws_frame_t frame = {
         .type = HTTPD_WS_TYPE_TEXT,
         .payload = (uint8_t *)data,
@@ -409,9 +412,15 @@ static esp_err_t ws_send_to_all(const char *data, size_t len)
         for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
             if (ws_connections[i].active) {
                 httpd_ws_send_frame_async(server, ws_connections[i].fd, &frame);
+                active_connections++;
             }
         }
         xSemaphoreGive(ws_mutex);
+        
+        total_sends++;
+        if (total_sends % 500 == 0) {
+            ESP_LOGI(TAG, "WS broadcast: %lu total sends, %d active connections", total_sends, active_connections);
+        }
     }
     return ESP_OK;
 }
@@ -571,23 +580,60 @@ esp_err_t web_server_enable_sensor(uint8_t sensor_id, bool enable)
 static void ws_broadcast_task(void *arg)
 {
     (void)arg;
-    char json[512];
+    char json[768];
+    uint32_t send_count = 0;
+    uint32_t no_data_count = 0;
+    
+    ESP_LOGI(TAG, "WebSocket broadcast task started");
+    
     for (;;) {
         imu_data_t d;
         if (data_buffer_get_latest(&d) == ESP_OK) {
             // Build compact JSON manually to reduce overhead
             int n = 0;
             n += snprintf(json + n, sizeof(json) - n, "{\"t\":%llu", (unsigned long long)d.timestamp_us);
+            if (d.magnetometer.valid) {
+                n += snprintf(json + n, sizeof(json) - n,
+                              ",\"mag_iis2\":{\"name\":\"IIS2MDC Magnetometer\",\"unit\":\"mG\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"temperature\":%.2f}",
+                              d.magnetometer.x_mg, d.magnetometer.y_mg, d.magnetometer.z_mg,
+                              d.magnetometer.temperature_c);
+            }
             if (d.accelerometer.valid) {
-                n += snprintf(json + n, sizeof(json) - n, ",\"acc\":{\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}",
-                              d.accelerometer.x_g, d.accelerometer.y_g, d.accelerometer.z_g);
+                const float ax_g = d.accelerometer.x_g;
+                const float ay_g = d.accelerometer.y_g;
+                const float az_g = d.accelerometer.z_g;
+                const float g_to_ms2 = 9.80665f;
+                n += snprintf(json + n, sizeof(json) - n,
+                              ",\"acc_iis3_g\":{\"name\":\"IIS3DWB Accelerometer\",\"unit\":\"g\",\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}",
+                              ax_g, ay_g, az_g);
+                n += snprintf(json + n, sizeof(json) - n,
+                              ",\"acc_iis3_ms2\":{\"name\":\"IIS3DWB Accelerometer\",\"unit\":\"m/s^2\",\"x\":%.5f,\"y\":%.5f,\"z\":%.5f}",
+                              ax_g * g_to_ms2, ay_g * g_to_ms2, az_g * g_to_ms2);
             }
             if (d.imu_6axis.valid) {
-                n += snprintf(json + n, sizeof(json) - n, ",\"gyr\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f}",
+                n += snprintf(json + n, sizeof(json) - n,
+                              ",\"gyr_icm\":{\"name\":\"ICM45686 Gyroscope\",\"unit\":\"deg/s\",\"x\":%.4f,\"y\":%.4f,\"z\":%.4f}",
                               d.imu_6axis.gyro_x_dps, d.imu_6axis.gyro_y_dps, d.imu_6axis.gyro_z_dps);
+            }
+            if (d.inclinometer.valid) {
+                n += snprintf(json + n, sizeof(json) - n,
+                              ",\"inc_scl\":{\"name\":\"SCL3300 Inclinometer\",\"unit\":\"deg\",\"angle_x\":%.2f,\"angle_y\":%.2f,\"angle_z\":%.2f,\"temperature\":%.2f}",
+                              d.inclinometer.angle_x_deg, d.inclinometer.angle_y_deg, d.inclinometer.angle_z_deg,
+                              d.inclinometer.temperature_c);
             }
             n += snprintf(json + n, sizeof(json) - n, "}");
             ws_send_to_all(json, n);
+            send_count++;
+            
+            // Log every 100 sends
+            if (send_count % 100 == 0) {
+                ESP_LOGI(TAG, "Sent %lu WebSocket messages (no_data: %lu)", send_count, no_data_count);
+            }
+        } else {
+            no_data_count++;
+            if (no_data_count % 100 == 0) {
+                ESP_LOGW(TAG, "No data available in buffer (count: %lu)", no_data_count);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(20)); // ~50 Hz
     }
@@ -597,13 +643,137 @@ static void ws_broadcast_task(void *arg)
 static esp_err_t root_handler(httpd_req_t *req)
 {
     static const char *html =
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>HBQ-IMU-C6 Realtime</title>"
-        "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>"
-        "<style>body{font-family:sans-serif;margin:16px}canvas{max-width:960px;width:100%}</style>"
-        "</head><body><h3>Realtime Accelerometer (g)</h3><canvas id=acc></canvas>"
-        "<script>const ctx=document.getElementById('acc');const chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[{label:'Ax',data:[],borderColor:'#e74c3c',tension:.1},{label:'Ay',data:[],borderColor:'#27ae60',tension:.1},{label:'Az',data:[],borderColor:'#2980b9',tension:.1}]},options:{animation:false,parsing:false,scales:{x:{display:false}}}});"
-        "const ws=new WebSocket(`ws://${location.host}/ws/data`);const maxP=500;ws.onmessage=(ev)=>{try{const m=JSON.parse(ev.data);if(m.acc){const t=(m.t/1000)|0;chart.data.labels.push(t);chart.data.datasets[0].data.push(m.acc.x);chart.data.datasets[1].data.push(m.acc.y);chart.data.datasets[2].data.push(m.acc.z);if(chart.data.labels.length>maxP){chart.data.labels.shift();chart.data.datasets.forEach(ds=>ds.data.shift())}chart.update('none');}}catch(e){}};"
-        "</script></body></html>";
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='utf-8'><title>ESP32 IMU</title>"
+        "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
+        "<style>"
+        "body{font-family:Arial;margin:20px;background:#f5f5f5}"
+        "h2{color:#333}"
+        ".status{padding:10px;background:#ffc;border:2px solid #000;margin:10px 0;font-weight:bold}"
+        ".charts{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin:20px 0}"
+        ".chart-box{background:#fff;padding:15px;border-radius:5px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}"
+        ".chart-box h3{margin:0 0 10px 0;color:#555;font-size:16px}"
+        "canvas{width:100%!important;height:200px!important}"
+        ".log{background:#f9f9f9;padding:10px;height:150px;overflow:auto;border:1px solid #ddd;font-family:monospace;font-size:11px}"
+        "</style></head><body>"
+        "<h2>ESP32-C6 IMU Monitor</h2>"
+        "<div class='status' id='status'>Initializing...</div>"
+        "<div class='charts' id='charts'></div>"
+        "<h3>Debug Log:</h3>"
+        "<div class='log' id='log'></div>"
+        "<script>"
+        "const log=document.getElementById('log');"
+        "const status=document.getElementById('status');"
+        "function addLog(msg){"
+        "  const t=new Date().toLocaleTimeString();"
+        "  log.innerHTML+='['+t+'] '+msg+'<br>';"
+        "  log.scrollTop=log.scrollHeight;"
+        "}"
+        "const chartsContainer=document.getElementById('charts');"
+        "addLog('Waiting for sensor data...');"
+        "const chartCfg={type:'line',options:{responsive:true,maintainAspectRatio:false,animation:false,"
+        "scales:{x:{display:false},y:{beginAtZero:false}}}};"
+        "const chartDefs={"
+        "mag_iis2:{title:'IIS2MDC Magnetometer (mG)',labels:['X','Y','Z'],colors:['#e74c3c','#27ae60','#2980b9']},"
+        "acc_iis3_g:{title:'IIS3DWB Accelerometer (g)',labels:['X','Y','Z'],colors:['#c0392b','#16a085','#8e44ad']},"
+        "acc_iis3_ms2:{title:'IIS3DWB Accelerometer (m/s^2)',labels:['X','Y','Z'],colors:['#d35400','#27ae60','#2980b9']},"
+        "gyr_icm:{title:'ICM45686 Gyroscope (deg/s)',labels:['X','Y','Z'],colors:['#f39c12','#9b59b6','#1abc9c']},"
+        "inc_scl:{title:'SCL3300 Inclinometer (deg)',labels:['Angle X','Angle Y','Angle Z'],colors:['#e67e22','#3498db','#2c3e50']}"
+        "};"
+        "const charts={};"
+        "const maxPoints=50;"
+        "const defaultColors=['#e74c3c','#27ae60','#2980b9','#8e44ad'];"
+        "function chartTitleFromPayload(key,payload){"
+        "  if(!payload){return (chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);}"
+        "  const base=payload.title||payload.name||(chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);"
+        "  if(payload.unit){return base+' ('+payload.unit+')';}"
+        "  return base;"
+        "}"
+        "function ensureChart(key,titleOverride,labelsOverride){"
+        "  if(charts[key]){"
+        "    if(titleOverride&&charts[key].titleEl.textContent!==titleOverride){charts[key].titleEl.textContent=titleOverride;}"
+        "    return charts[key];"
+        "  }"
+        "  const def=chartDefs[key]||{};"
+        "  const labels=labelsOverride||def.labels||['X','Y','Z'];"
+        "  const colors=(def.colors&&def.colors.length?def.colors:defaultColors).slice();"
+        "  const box=document.createElement('div');"
+        "  box.className='chart-box';"
+        "  const title=document.createElement('h3');"
+        "  title.textContent=titleOverride||def.title||('Sensor '+key);"
+        "  box.appendChild(title);"
+        "  const canvas=document.createElement('canvas');"
+        "  box.appendChild(canvas);"
+        "  chartsContainer.appendChild(box);"
+        "  const datasets=labels.map((label,idx)=>({label:label,data:[],borderColor:colors[idx%colors.length],borderWidth:2,pointRadius:0}));"
+        "  const chart=new Chart(canvas.getContext('2d'),{...chartCfg,data:{labels:[],datasets}});"
+        "  charts[key]={chart:chart,titleEl:title};"
+        "  addLog('Created chart for '+title.textContent);"
+        "  return charts[key];"
+        "}"
+        "function pushValues(key,label,payload){"
+        "  const values=payload&&payload.values?payload.values:payload;"
+        "  if(!values||values.length===0){return;}"
+        "  const entry=ensureChart(key,chartTitleFromPayload(key,payload),payload&&payload.labels);"
+        "  if(!entry){return;}"
+        "  const chart=entry.chart;"
+        "  chart.data.labels.push(label);"
+        "  chart.data.datasets.forEach((ds,idx)=>ds.data.push(values[idx]));"
+        "  if(chart.data.labels.length>maxPoints){"
+        "    chart.data.labels.shift();"
+        "    chart.data.datasets.forEach(ds=>ds.data.shift());"
+        "  }"
+        "  chart.update('none');"
+        "}"
+        "const wsUrl='ws://'+location.hostname+':'+location.port+'/ws/data';"
+        "addLog('Connecting to '+wsUrl);"
+        "const ws=new WebSocket(wsUrl);"
+        "let msgCount=0;"
+        "ws.onopen=()=>{"
+        "  addLog('WebSocket CONNECTED');"
+        "  status.innerHTML='Connected';"
+        "  status.style.background='#9f9';"
+        "};"
+        "ws.onerror=(e)=>{"
+        "  addLog('WebSocket ERROR');"
+        "  status.innerHTML='Error';"
+        "  status.style.background='#f99';"
+        "};"
+        "ws.onclose=()=>{"
+        "  addLog('WebSocket CLOSED');"
+        "  status.innerHTML='Disconnected';"
+        "  status.style.background='#ffc';"
+        "};"
+        "ws.onmessage=(ev)=>{"
+        "  msgCount++;"
+        "  try{"
+        "    const d=JSON.parse(ev.data);"
+        "    const t=msgCount;"
+        "    if(d.mag_iis2){"
+        "      pushValues('mag_iis2',t,{values:[d.mag_iis2.x,d.mag_iis2.y,d.mag_iis2.z],name:d.mag_iis2.name,unit:d.mag_iis2.unit});"
+        "    }"
+        "    if(d.acc_iis3_g){"
+        "      pushValues('acc_iis3_g',t,{values:[d.acc_iis3_g.x,d.acc_iis3_g.y,d.acc_iis3_g.z],name:d.acc_iis3_g.name,unit:d.acc_iis3_g.unit});"
+        "    }"
+        "    if(d.acc_iis3_ms2){"
+        "      pushValues('acc_iis3_ms2',t,{values:[d.acc_iis3_ms2.x,d.acc_iis3_ms2.y,d.acc_iis3_ms2.z],name:d.acc_iis3_ms2.name,unit:d.acc_iis3_ms2.unit});"
+        "    }"
+        "    if(d.gyr_icm){"
+        "      pushValues('gyr_icm',t,{values:[d.gyr_icm.x,d.gyr_icm.y,d.gyr_icm.z],name:d.gyr_icm.name,unit:d.gyr_icm.unit});"
+        "    }"
+        "    if(d.inc_scl){"
+        "      pushValues('inc_scl',t,{values:[d.inc_scl.angle_x,d.inc_scl.angle_y,d.inc_scl.angle_z],name:d.inc_scl.name,unit:d.inc_scl.unit,labels:['Angle X','Angle Y','Angle Z']});"
+        "    }"
+        "    if(msgCount%10===0){"
+        "      status.innerHTML='Connected - '+msgCount+' msgs';"
+        "      addLog('Received '+msgCount+' messages');"
+        "    }"
+        "  }catch(e){"
+        "    addLog('Parse error: '+e);"
+        "  }"
+        "};"
+        "</script>"
+        "</body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
