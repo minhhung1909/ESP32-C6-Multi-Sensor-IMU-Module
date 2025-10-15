@@ -1,4 +1,7 @@
 .vscode
+
+ESP32C6_IIS3DWBTR Test/.vscode
+
 ESP32C6_IMU_WebMonitor/build
 ESP32C6_IMU_WebMonitor/sdkconfig.old
 program
