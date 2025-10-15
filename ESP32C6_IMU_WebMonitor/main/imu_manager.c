@@ -324,9 +324,24 @@ esp_err_t imu_manager_enable_sensor(uint8_t sensor_id, bool enable)
     } else {
         enabled_sensors &= ~sensor_id;
     }
-    
+
     ESP_LOGI(TAG, "Sensor 0x%02X %s", sensor_id, enable ? "enabled" : "disabled");
     return ESP_OK;
+}
+
+uint32_t imu_manager_get_sampling_rate(void)
+{
+    return sampling_rate_hz;
+}
+
+uint16_t imu_manager_get_fifo_watermark(void)
+{
+    return fifo_watermark;
+}
+
+uint8_t imu_manager_get_enabled_sensors(void)
+{
+    return enabled_sensors;
 }
 
 esp_err_t imu_manager_deinit(void)

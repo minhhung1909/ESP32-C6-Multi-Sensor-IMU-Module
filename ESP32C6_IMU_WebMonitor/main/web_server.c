@@ -6,6 +6,8 @@
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include "esp_timer.h"
 
 static const char *TAG = "WEB_SERVER";
 
@@ -24,10 +26,8 @@ static SemaphoreHandle_t ws_mutex = NULL;
 // Forward declarations
 static esp_err_t api_data_handler(httpd_req_t *req);
 static esp_err_t api_stats_handler(httpd_req_t *req);
-static esp_err_t api_config_handler(httpd_req_t *req);
 static esp_err_t api_download_handler(httpd_req_t *req);
-static esp_err_t ws_data_handler(httpd_req_t *req);
-static esp_err_t ws_control_handler(httpd_req_t *req);
+static void ws_register_connection(int fd);
 static esp_err_t file_handler(httpd_req_t *req);
 static void ws_register_connection(int fd);
 static void ws_unregister_connection(int fd);
@@ -170,18 +170,35 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "API Config request");
     
     if (req->method == HTTP_POST) {
-        // Handle POST request for configuration
-        char content[256];
-        int ret = httpd_req_recv(req, content, sizeof(content) - 1);
-        if (ret <= 0) {
+        size_t total_len = req->content_len;
+        if (total_len == 0 || total_len > 2048) {
             httpd_resp_set_status(req, "400 Bad Request");
-            httpd_resp_send(req, "No data received", HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send(req, "Invalid content length", HTTPD_RESP_USE_STRLEN);
             return ESP_FAIL;
         }
-        content[ret] = '\0';
+
+        char *content = malloc(total_len + 1);
+        if (!content) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_send(req, "Out of memory", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+
+        size_t received = 0;
+        while (received < total_len) {
+            int ret = httpd_req_recv(req, content + received, total_len - received);
+            if (ret <= 0) {
+                free(content);
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_send(req, "Failed to read body", HTTPD_RESP_USE_STRLEN);
+                return ESP_FAIL;
+            }
+            received += ret;
+        }
+        content[received] = '\0';
         
-        // Parse JSON configuration
         cJSON *json = cJSON_Parse(content);
+        free(content);
         if (json == NULL) {
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_send(req, "Invalid JSON", HTTPD_RESP_USE_STRLEN);
@@ -198,6 +215,25 @@ static esp_err_t api_config_handler(httpd_req_t *req)
         if (cJSON_IsNumber(watermark)) {
             imu_manager_set_fifo_watermark(watermark->valueint);
         }
+
+        cJSON *sensors = cJSON_GetObjectItem(json, "sensors");
+        if (cJSON_IsObject(sensors)) {
+            struct {
+                const char *key;
+                uint8_t id;
+            } sensor_map[] = {
+                {"magnetometer", SENSOR_MAGNETOMETER},
+                {"accelerometer", SENSOR_ACCELEROMETER},
+                {"imu_6axis", SENSOR_IMU_6AXIS},
+                {"inclinometer", SENSOR_INCLINOMETER},
+            };
+            for (size_t i = 0; i < sizeof(sensor_map)/sizeof(sensor_map[0]); ++i) {
+                cJSON *item = cJSON_GetObjectItem(sensors, sensor_map[i].key);
+                if (cJSON_IsBool(item)) {
+                    imu_manager_enable_sensor(sensor_map[i].id, cJSON_IsTrue(item));
+                }
+            }
+        }
         
         cJSON_Delete(json);
         
@@ -207,8 +243,15 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     } else {
         // Handle GET request - return current configuration
         cJSON *json = cJSON_CreateObject();
-        cJSON_AddNumberToObject(json, "sampling_rate", 100); // TODO: Get from IMU manager
-        cJSON_AddNumberToObject(json, "fifo_watermark", 32); // TODO: Get from IMU manager
+        cJSON_AddNumberToObject(json, "sampling_rate", imu_manager_get_sampling_rate());
+        cJSON_AddNumberToObject(json, "fifo_watermark", imu_manager_get_fifo_watermark());
+        uint8_t enabled = imu_manager_get_enabled_sensors();
+        cJSON *sensors = cJSON_CreateObject();
+        cJSON_AddBoolToObject(sensors, "magnetometer", (enabled & SENSOR_MAGNETOMETER) != 0);
+        cJSON_AddBoolToObject(sensors, "accelerometer", (enabled & SENSOR_ACCELEROMETER) != 0);
+        cJSON_AddBoolToObject(sensors, "imu_6axis", (enabled & SENSOR_IMU_6AXIS) != 0);
+        cJSON_AddBoolToObject(sensors, "inclinometer", (enabled & SENSOR_INCLINOMETER) != 0);
+        cJSON_AddItemToObject(json, "sensors", sensors);
         
         char *json_string = cJSON_Print(json);
         if (json_string != NULL) {
@@ -237,26 +280,30 @@ static esp_err_t api_download_handler(httpd_req_t *req)
             char format[16];
             if (httpd_query_key_value(buf, "format", format, sizeof(format)) == ESP_OK) {
                 if (strcmp(format, "csv") == 0) {
-                    // Return CSV data
-                    char csv_buffer[8192];
-                    esp_err_t ret = data_buffer_export_csv(csv_buffer, sizeof(csv_buffer), 100);
-                    if (ret == ESP_OK) {
+                    char *csv_buffer = NULL;
+                    size_t csv_len = 0;
+                    esp_err_t ret = data_buffer_export_csv_dynamic(&csv_buffer, &csv_len, 100);
+                    if (ret == ESP_OK && csv_buffer != NULL) {
                         httpd_resp_set_type(req, "text/csv");
                         httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=imu_data.csv");
-                        httpd_resp_send(req, csv_buffer, strlen(csv_buffer));
+                        httpd_resp_send(req, csv_buffer, csv_len);
+                        free(csv_buffer);
                     } else {
+                        if (csv_buffer) free(csv_buffer);
                         httpd_resp_set_status(req, "500 Internal Server Error");
                         httpd_resp_send(req, "Failed to export CSV", HTTPD_RESP_USE_STRLEN);
                     }
                 } else if (strcmp(format, "json") == 0) {
-                    // Return JSON data
-                    char json_buffer[8192];
-                    esp_err_t ret = data_buffer_export_json(json_buffer, sizeof(json_buffer), 100);
-                    if (ret == ESP_OK) {
+                    char *json_buffer = NULL;
+                    size_t json_len = 0;
+                    esp_err_t ret = data_buffer_export_json_dynamic(&json_buffer, &json_len, 100);
+                    if (ret == ESP_OK && json_buffer != NULL) {
                         httpd_resp_set_type(req, "application/json");
                         httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=imu_data.json");
-                        httpd_resp_send(req, json_buffer, strlen(json_buffer));
+                        httpd_resp_send(req, json_buffer, json_len);
+                        free(json_buffer);
                     } else {
+                        if (json_buffer) free(json_buffer);
                         httpd_resp_set_status(req, "500 Internal Server Error");
                         httpd_resp_send(req, "Failed to export JSON", HTTPD_RESP_USE_STRLEN);
                     }
@@ -468,11 +515,19 @@ esp_err_t web_server_start(void)
         
         httpd_uri_t api_config_uri = {
             .uri = API_CONFIG_PATH,
-            .method = HTTP_GET | HTTP_POST,
+            .method = HTTP_GET,
             .handler = api_config_handler,
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_config_uri);
+
+        httpd_uri_t api_config_post_uri = {
+            .uri = API_CONFIG_PATH,
+            .method = HTTP_POST,
+            .handler = api_config_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_config_post_uri);
         
         httpd_uri_t api_download_uri = {
             .uri = API_DOWNLOAD_PATH,
@@ -541,26 +596,6 @@ esp_err_t web_server_broadcast_data(const char *data, size_t len)
     return ws_send_to_all(data, len);
 }
 
-esp_err_t web_server_broadcast_stats(const char *stats, size_t len)
-{
-    return ws_send_to_all(stats, len);
-}
-
-esp_err_t websocket_send_data(httpd_handle_t hd, int fd, const char *data, size_t len)
-{
-    httpd_ws_frame_t frame = {
-        .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)data,
-        .len = len
-    };
-    return httpd_ws_send_frame_async(hd, fd, &frame);
-}
-
-esp_err_t websocket_send_json(httpd_handle_t hd, int fd, const char *json_data)
-{
-    return websocket_send_data(hd, fd, json_data, strlen(json_data));
-}
-
 esp_err_t web_server_set_sampling_rate(uint32_t rate_hz)
 {
     return imu_manager_set_sampling_rate(rate_hz);
@@ -583,12 +618,33 @@ static void ws_broadcast_task(void *arg)
     char json[768];
     uint32_t send_count = 0;
     uint32_t no_data_count = 0;
+    uint64_t rate_window_start_us = 0;
+    uint32_t rate_window_msgs = 0;
+    float last_msg_rate = 0.0f;
     
     ESP_LOGI(TAG, "WebSocket broadcast task started");
     
     for (;;) {
         imu_data_t d;
         if (data_buffer_get_latest(&d) == ESP_OK) {
+            uint64_t now_us = (d.timestamp_us != 0) ? d.timestamp_us : esp_timer_get_time();
+            if (rate_window_start_us == 0 || now_us <= rate_window_start_us) {
+                rate_window_start_us = now_us;
+                rate_window_msgs = 0;
+            }
+            rate_window_msgs++;
+            uint64_t elapsed_us = now_us - rate_window_start_us;
+            float current_rate = 0.0f;
+            if (elapsed_us > 0) {
+                current_rate = (rate_window_msgs * 1000000.0f) / (float)elapsed_us;
+            }
+            if (elapsed_us >= 1000000ULL) {
+                rate_window_msgs = 0;
+                rate_window_start_us = now_us;
+                last_msg_rate = current_rate;
+            } else if (current_rate > 0.0f) {
+                last_msg_rate = current_rate;
+            }
             // Build compact JSON manually to reduce overhead
             int n = 0;
             n += snprintf(json + n, sizeof(json) - n, "{\"t\":%llu", (unsigned long long)d.timestamp_us);
@@ -621,7 +677,9 @@ static void ws_broadcast_task(void *arg)
                               d.inclinometer.angle_x_deg, d.inclinometer.angle_y_deg, d.inclinometer.angle_z_deg,
                               d.inclinometer.temperature_c);
             }
-            n += snprintf(json + n, sizeof(json) - n, "}");
+            n += snprintf(json + n, sizeof(json) - n,
+                          ",\"statistics\":{\"msg_per_second\":%.2f}}",
+                          last_msg_rate);
             ws_send_to_all(json, n);
             send_count++;
             
@@ -644,136 +702,97 @@ static esp_err_t root_handler(httpd_req_t *req)
 {
     static const char *html =
         "<!DOCTYPE html>"
-        "<html><head><meta charset='utf-8'><title>ESP32 IMU</title>"
+        "<html><head><meta charset='utf-8'><title>ESP32-C6 IMU Monitor</title>"
         "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
         "<style>"
-        "body{font-family:Arial;margin:20px;background:#f5f5f5}"
-        "h2{color:#333}"
-        ".status{padding:10px;background:#ffc;border:2px solid #000;margin:10px 0;font-weight:bold}"
-        ".charts{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin:20px 0}"
-        ".chart-box{background:#fff;padding:15px;border-radius:5px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}"
-        ".chart-box h3{margin:0 0 10px 0;color:#555;font-size:16px}"
-        "canvas{width:100%!important;height:200px!important}"
-        ".log{background:#f9f9f9;padding:10px;height:150px;overflow:auto;border:1px solid #ddd;font-family:monospace;font-size:11px}"
+        "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f8fafc;color:#1e293b}"
+        "h2{color:#0369a1;margin-bottom:12px}"
+        ".status{padding:12px;border-left:4px solid #10b981;background:#fff;margin:12px 0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+        ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:20px 0}"
+        ".metric{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}"
+        ".metric .label{display:block;font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.05em}"
+        ".metric .value{display:block;font-size:20px;font-weight:600;margin-top:6px;color:#0f172a}"
+        ".chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin:18px 0}"
+        ".chart-box{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+        ".chart-box h3{margin:0 0 10px 0;color:#0284c7;font-size:15px}"
+        "canvas{width:100%!important;height:220px!important;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px}"
+        ".log{background:#fff;padding:12px;height:160px;overflow:auto;border:1px solid #e2e8f0;border-radius:6px;font-family:monospace;font-size:11px;color:#475569}"
         "</style></head><body>"
-        "<h2>ESP32-C6 IMU Monitor</h2>"
-        "<div class='status' id='status'>Initializing...</div>"
-        "<div class='charts' id='charts'></div>"
-        "<h3>Debug Log:</h3>"
+        "<h2>ESP32-C6 IMU Web Monitor</h2>"
+        "<div class='status' id='status'>Connecting...</div>"
+        "<div class='metrics'>"
+        "  <div class='metric'><span class='label'>Messages</span><span class='value' id='metricMsg'>0</span></div>"
+        "  <div class='metric'><span class='label'>Active Sensors</span><span class='value' id='metricSensors'>0</span></div>"
+        "  <div class='metric'><span class='label'>msg/s</span><span class='value' id='metricMsgRate'>0</span></div>"
+        "</div>"
+        "<div class='chart-grid' id='charts'></div>"
+        "<h3 style='color:#0284c7;margin-top:24px;'>Event Log</h3>"
         "<div class='log' id='log'></div>"
         "<script>"
-        "const log=document.getElementById('log');"
-        "const status=document.getElementById('status');"
-        "function addLog(msg){"
-        "  const t=new Date().toLocaleTimeString();"
-        "  log.innerHTML+='['+t+'] '+msg+'<br>';"
-        "  log.scrollTop=log.scrollHeight;"
-        "}"
-        "const chartsContainer=document.getElementById('charts');"
-        "addLog('Waiting for sensor data...');"
-        "const chartCfg={type:'line',options:{responsive:true,maintainAspectRatio:false,animation:false,"
-        "scales:{x:{display:false},y:{beginAtZero:false}}}};"
-        "const chartDefs={"
-        "mag_iis2:{title:'IIS2MDC Magnetometer (mG)',labels:['X','Y','Z'],colors:['#e74c3c','#27ae60','#2980b9']},"
-        "acc_iis3_g:{title:'IIS3DWB Accelerometer (g)',labels:['X','Y','Z'],colors:['#c0392b','#16a085','#8e44ad']},"
-        "acc_iis3_ms2:{title:'IIS3DWB Accelerometer (m/s^2)',labels:['X','Y','Z'],colors:['#d35400','#27ae60','#2980b9']},"
-        "gyr_icm:{title:'ICM45686 Gyroscope (deg/s)',labels:['X','Y','Z'],colors:['#f39c12','#9b59b6','#1abc9c']},"
-        "inc_scl:{title:'SCL3300 Inclinometer (deg)',labels:['Angle X','Angle Y','Angle Z'],colors:['#e67e22','#3498db','#2c3e50']}"
-        "};"
-        "const charts={};"
-        "const maxPoints=50;"
-        "const defaultColors=['#e74c3c','#27ae60','#2980b9','#8e44ad'];"
-        "function chartTitleFromPayload(key,payload){"
-        "  if(!payload){return (chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);}"
-        "  const base=payload.title||payload.name||(chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);"
-        "  if(payload.unit){return base+' ('+payload.unit+')';}"
-        "  return base;"
-        "}"
-        "function ensureChart(key,titleOverride,labelsOverride){"
-        "  if(charts[key]){"
-        "    if(titleOverride&&charts[key].titleEl.textContent!==titleOverride){charts[key].titleEl.textContent=titleOverride;}"
+        "(()=>{"
+        "  const statusEl=document.getElementById('status');"
+        "  const logEl=document.getElementById('log');"
+        "  const chartsContainer=document.getElementById('charts');"
+        "  const metrics={"
+        "    msg:document.getElementById('metricMsg'),"
+        "    sensors:document.getElementById('metricSensors'),"
+        "    msgRate:document.getElementById('metricMsgRate')"
+        "  };"
+        "  const chartCfg={type:'line',options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{display:false},y:{beginAtZero:false,grid:{color:'rgba(226,232,240,0.9)'}}}}};"
+        "  const defaultColors=['#ef4444','#10b981','#3b82f6','#f97316'];"
+        "  const chartDefs={"
+        "    mag_iis2:{title:'IIS2MDC Magnetometer (mG)',labels:['X','Y','Z'],colors:['#dc2626','#16a34a','#1d4ed8']},"
+        "    acc_iis3_g:{title:'IIS3DWB Accelerometer (g)',labels:['X','Y','Z'],colors:['#b91c1c','#047857','#7c3aed']},"
+        "    acc_iis3_ms2:{title:'IIS3DWB Accelerometer (m/s²)',labels:['X','Y','Z'],colors:['#d97706','#22c55e','#2563eb']},"
+        "    gyr_icm:{title:'ICM45686 Gyroscope (deg/s)',labels:['X','Y','Z'],colors:['#f59e0b','#8b5cf6','#0ea5e9']},"
+        "    inc_scl:{title:'SCL3300 Inclinometer (deg)',labels:['Angle X','Angle Y','Angle Z'],colors:['#e67e22','#3b82f6','#1e293b']}"
+        "  };"
+        "  const charts={};"
+        "  const maxPoints=100;"
+        "  let msgCount=0;"
+        "  function addLog(msg){const t=new Date().toLocaleTimeString();logEl.innerHTML='['+t+'] '+msg+'<br>'+logEl.innerHTML;const parts=logEl.innerHTML.split('<br>');if(parts.length>200){logEl.innerHTML=parts.slice(0,200).join('<br>');}}"
+        "  function chartTitle(key,payload){if(!payload){return(chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);}const base=payload.title||payload.name||(chartDefs[key]&&chartDefs[key].title)||('Sensor '+key);return payload.unit?base+' ('+payload.unit+')':base;}"
+        "  function ensureChart(key,payload){if(charts[key]){const title=chartTitle(key,payload);if(title&&charts[key].titleEl.textContent!==title){charts[key].titleEl.textContent=title;}return charts[key];}"
+        "    const def=chartDefs[key]||{};const labels=payload&&payload.labels?payload.labels:def.labels||['X','Y','Z'];const colors=(payload&&payload.colors)||def.colors||defaultColors;"
+        "    const box=document.createElement('div');box.className='chart-box';const titleEl=document.createElement('h3');titleEl.textContent=chartTitle(key,payload);box.appendChild(titleEl);const canvas=document.createElement('canvas');box.appendChild(canvas);"
+        "    chartsContainer.appendChild(box);"
+        "    const datasets=labels.map((label,idx)=>({label,data:[],borderColor:colors[idx%colors.length],borderWidth:1.8,pointRadius:0}));"
+        "    const chart=new Chart(canvas.getContext('2d'),{...chartCfg,data:{labels:[],datasets}});"
+        "    charts[key]={chart,titleEl};"
+        "    addLog('Created chart for '+titleEl.textContent);"
+        "    metrics.sensors.textContent=Object.keys(charts).length;"
         "    return charts[key];"
         "  }"
-        "  const def=chartDefs[key]||{};"
-        "  const labels=labelsOverride||def.labels||['X','Y','Z'];"
-        "  const colors=(def.colors&&def.colors.length?def.colors:defaultColors).slice();"
-        "  const box=document.createElement('div');"
-        "  box.className='chart-box';"
-        "  const title=document.createElement('h3');"
-        "  title.textContent=titleOverride||def.title||('Sensor '+key);"
-        "  box.appendChild(title);"
-        "  const canvas=document.createElement('canvas');"
-        "  box.appendChild(canvas);"
-        "  chartsContainer.appendChild(box);"
-        "  const datasets=labels.map((label,idx)=>({label:label,data:[],borderColor:colors[idx%colors.length],borderWidth:2,pointRadius:0}));"
-        "  const chart=new Chart(canvas.getContext('2d'),{...chartCfg,data:{labels:[],datasets}});"
-        "  charts[key]={chart:chart,titleEl:title};"
-        "  addLog('Created chart for '+title.textContent);"
-        "  return charts[key];"
-        "}"
-        "function pushValues(key,label,payload){"
-        "  const values=payload&&payload.values?payload.values:payload;"
-        "  if(!values||values.length===0){return;}"
-        "  const entry=ensureChart(key,chartTitleFromPayload(key,payload),payload&&payload.labels);"
-        "  if(!entry){return;}"
-        "  const chart=entry.chart;"
-        "  chart.data.labels.push(label);"
-        "  chart.data.datasets.forEach((ds,idx)=>ds.data.push(values[idx]));"
-        "  if(chart.data.labels.length>maxPoints){"
-        "    chart.data.labels.shift();"
-        "    chart.data.datasets.forEach(ds=>ds.data.shift());"
+        "  function pushValues(key,payload){const values=payload&&payload.values?payload.values:payload;if(!values||!values.length)return;const entry=ensureChart(key,payload);const chart=entry.chart;"
+        "    chart.data.labels.push(msgCount);chart.data.datasets.forEach((ds,idx)=>ds.data.push(values[idx]));"
+        "    if(chart.data.labels.length>maxPoints){chart.data.labels.shift();chart.data.datasets.forEach(ds=>ds.data.shift());}"
+        "    chart.update('none');"
         "  }"
-        "  chart.update('none');"
-        "}"
-        "const wsUrl='ws://'+location.hostname+':'+location.port+'/ws/data';"
-        "addLog('Connecting to '+wsUrl);"
-        "const ws=new WebSocket(wsUrl);"
-        "let msgCount=0;"
-        "ws.onopen=()=>{"
-        "  addLog('WebSocket CONNECTED');"
-        "  status.innerHTML='Connected';"
-        "  status.style.background='#9f9';"
-        "};"
-        "ws.onerror=(e)=>{"
-        "  addLog('WebSocket ERROR');"
-        "  status.innerHTML='Error';"
-        "  status.style.background='#f99';"
-        "};"
-        "ws.onclose=()=>{"
-        "  addLog('WebSocket CLOSED');"
-        "  status.innerHTML='Disconnected';"
-        "  status.style.background='#ffc';"
-        "};"
-        "ws.onmessage=(ev)=>{"
-        "  msgCount++;"
-        "  try{"
-        "    const d=JSON.parse(ev.data);"
-        "    const t=msgCount;"
-        "    if(d.mag_iis2){"
-        "      pushValues('mag_iis2',t,{values:[d.mag_iis2.x,d.mag_iis2.y,d.mag_iis2.z],name:d.mag_iis2.name,unit:d.mag_iis2.unit});"
-        "    }"
-        "    if(d.acc_iis3_g){"
-        "      pushValues('acc_iis3_g',t,{values:[d.acc_iis3_g.x,d.acc_iis3_g.y,d.acc_iis3_g.z],name:d.acc_iis3_g.name,unit:d.acc_iis3_g.unit});"
-        "    }"
-        "    if(d.acc_iis3_ms2){"
-        "      pushValues('acc_iis3_ms2',t,{values:[d.acc_iis3_ms2.x,d.acc_iis3_ms2.y,d.acc_iis3_ms2.z],name:d.acc_iis3_ms2.name,unit:d.acc_iis3_ms2.unit});"
-        "    }"
-        "    if(d.gyr_icm){"
-        "      pushValues('gyr_icm',t,{values:[d.gyr_icm.x,d.gyr_icm.y,d.gyr_icm.z],name:d.gyr_icm.name,unit:d.gyr_icm.unit});"
-        "    }"
-        "    if(d.inc_scl){"
-        "      pushValues('inc_scl',t,{values:[d.inc_scl.angle_x,d.inc_scl.angle_y,d.inc_scl.angle_z],name:d.inc_scl.name,unit:d.inc_scl.unit,labels:['Angle X','Angle Y','Angle Z']});"
-        "    }"
-        "    if(msgCount%10===0){"
-        "      status.innerHTML='Connected - '+msgCount+' msgs';"
-        "      addLog('Received '+msgCount+' messages');"
-        "    }"
-        "  }catch(e){"
-        "    addLog('Parse error: '+e);"
-        "  }"
-        "};"
+        "  addLog('Waiting for sensor data...');"
+        "  const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/data';"
+        "  addLog('Connecting to '+wsUrl);"
+        "  const ws=new WebSocket(wsUrl);"
+        "  ws.onopen=()=>{addLog('WebSocket connected');statusEl.textContent='Connected';statusEl.style.borderLeftColor='#10b981';statusEl.style.background='#fff';};"
+        "  ws.onerror=()=>{addLog('WebSocket error');statusEl.textContent='Error';statusEl.style.borderLeftColor='#ef4444';statusEl.style.background='#fef2f2';};"
+        "  ws.onclose=()=>{addLog('WebSocket closed');statusEl.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b';statusEl.style.background='#fffbeb';};"
+        "  ws.onmessage=(ev)=>{"
+        "    msgCount++;"
+        "    try{"
+        "      const payload=JSON.parse(ev.data);"
+        "      metrics.msg.textContent=msgCount;"
+        "      if(payload&&payload.statistics&&payload.statistics.msg_per_second!==undefined){metrics.msgRate.textContent=payload.statistics.msg_per_second.toFixed(1);}"
+        "      if(payload.mag_iis2){pushValues('mag_iis2',{values:[payload.mag_iis2.x,payload.mag_iis2.y,payload.mag_iis2.z],name:payload.mag_iis2.name,unit:payload.mag_iis2.unit});}"
+        "      if(payload.acc_iis3_g){pushValues('acc_iis3_g',{values:[payload.acc_iis3_g.x,payload.acc_iis3_g.y,payload.acc_iis3_g.z],name:payload.acc_iis3_g.name,unit:payload.acc_iis3_g.unit});}"
+        "      if(payload.acc_iis3_ms2){pushValues('acc_iis3_ms2',{values:[payload.acc_iis3_ms2.x,payload.acc_iis3_ms2.y,payload.acc_iis3_ms2.z],name:payload.acc_iis3_ms2.name,unit:payload.acc_iis3_ms2.unit});}"
+        "      if(payload.gyr_icm){pushValues('gyr_icm',{values:[payload.gyr_icm.x,payload.gyr_icm.y,payload.gyr_icm.z],name:payload.gyr_icm.name,unit:payload.gyr_icm.unit});}"
+        "      if(payload.inc_scl){pushValues('inc_scl',{values:[payload.inc_scl.angle_x,payload.inc_scl.angle_y,payload.inc_scl.angle_z],name:payload.inc_scl.name,unit:payload.inc_scl.unit,labels:['Angle X','Angle Y','Angle Z']});}"
+        "      if(msgCount%25===0){addLog('Received '+msgCount+' messages');}"
+        "    }catch(err){addLog('Parse error: '+err.message);}"
+        "  };"
+        "})();"
         "</script>"
-        "</body></html>";
+        "</body></html>"
+        "";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }

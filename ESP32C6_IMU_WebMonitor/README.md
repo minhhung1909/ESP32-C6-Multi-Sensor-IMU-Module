@@ -1,8 +1,10 @@
 # ESP32-C6 IMU Web Monitor
 
-> [VI] Ứng dụng web giám sát IMU realtime trên ESP32‑C6. Dashboard HTML/JS tích hợp, stream dữ liệu qua WebSocket `/ws/data`. Các mục song ngữ có nhãn [VI].
+> [VI] Ứng dụng web giám sát IMU realtime trên ESP32‑C6. Dashboard HTML/JS tích hợp kết nối trực tiếp tới firmware. Các mục song ngữ có nhãn [VI].
 
 A high-performance web-based monitoring system for multiple IMU sensors with real-time data visualization and control capabilities.
+
+![Web UI](imgs/webui.png)
 
 ## 🌟 Features
 
@@ -11,8 +13,8 @@ A high-performance web-based monitoring system for multiple IMU sensors with rea
 - **Real-time Web Interface**: Live data visualization with charts and graphs
 - **Multi-Sensor Support**: Simultaneous monitoring of 4 different IMU sensors
 - **High-Speed Data Collection**: Up to 26.7kHz sampling rate with FIFO buffering
-- **REST API**: JSON endpoints for data access and configuration
-- **WebSocket Support**: Real-time data streaming to web clients
+- **REST API**: JSON endpoints for data access and statistics
+- **Realtime Dashboard**: Web UI nhận dữ liệu trực tiếp từ firmware
 - **Data Export**: CSV and JSON download capabilities
 - **Remote Configuration**: Web-based sensor configuration interface
 - **Performance Monitoring**: Built-in statistics and performance metrics
@@ -65,48 +67,20 @@ Open browser and navigate to the ESP32's IP address (check serial monitor for IP
 [VI] Giao diện Web
 
 ### Dashboard Features
-- **Real-time Charts**: Live visualization of sensor data
-- **Multi-sensor Display**: Simultaneous monitoring of all sensors
-- **Data Statistics**: Performance metrics and buffer statistics
-- **Configuration Panel**: Remote sensor configuration
-- **Data Export**: Download data in CSV or JSON format
-- **WebSocket Streaming**: Low-latency push via `ws://<device-ip>/ws/data`
+- **Real-time Charts**: Live visualization of active sensors
+- **Multi-sensor Display**: Cards auto-create for each detected sensor driver
+- **Metrics Panel**: Messages received, active sensors, streaming rate
+- **Data Export**: Download recent samples in CSV hoặc JSON
 
 ### API Endpoints
 
 [VI] API
 
 #### Data Access
-- `GET /api/data` - Get latest sensor readings
-- `GET /api/stats` - Get buffer and performance statistics
-- `GET /api/download?format=csv` - Download data as CSV
-- `GET /api/download?format=json` - Download data as JSON
-
-#### Realtime Streaming
-- `WS /ws/data` - WebSocket endpoint publishing compact JSON frames at ~50 Hz
-
-Example message:
-```json
-{"t": 1234567890, "acc": {"x": 0.01, "y": -0.02, "z": 0.98}, "gyr": {"x": 0.1, "y": 0.0, "z": -0.1}}
-```
-
-#### Configuration
-- `GET /api/config` - Get current configuration
-- `POST /api/config` - Update configuration
-
-Example configuration update:
-```json
-{
-  "sampling_rate": 100,
-  "fifo_watermark": 32,
-  "enabled_sensors": {
-    "magnetometer": true,
-    "accelerometer": true,
-    "imu_6axis": true,
-    "inclinometer": true
-  }
-}
-```
+- `GET /api/data` – Trả snapshot giá trị sensor mới nhất
+- `GET /api/stats` – Trả thống kê buffer và thông lượng
+- `GET /api/download?format=csv` – Xuất dữ liệu vòng đệm (CSV)
+- `GET /api/download?format=json` – Xuất dữ liệu vòng đệm (JSON)
 
 ## 🔧 Configuration
 
@@ -128,11 +102,10 @@ Update GPIO pins in `main/main.c` if needed:
 #define PIN_NUM_CS_1            19
 
 // ICM45686 (SPI)
-#define PIN_NUM_MISO_2          19
-#define PIN_NUM_MOSI_2          23
-#define PIN_NUM_CLK_2           18
+#define PIN_NUM_MISO_2          2
+#define PIN_NUM_MOSI_2          7
+#define PIN_NUM_CLK_2           6
 #define PIN_NUM_CS_2            5
-#define PIN_NUM_INT_2           4
 
 // SCL3300 (SPI)
 #define PIN_NUM_MISO_3          2
@@ -141,18 +114,10 @@ Update GPIO pins in `main/main.c` if needed:
 #define PIN_NUM_CS_3            20
 ```
 
-### Software Configuration
-
-#### Sampling Rates
-- **Magnetometer**: 100Hz (adjustable)
-- **Accelerometer**: 26.7kHz (maximum)
-- **IMU 6-axis**: 100Hz (adjustable)
-- **Inclinometer**: 1kHz (adjustable)
-
-#### Buffer Configuration
-- **Buffer Size**: 1000 samples (configurable)
-- **FIFO Watermark**: 32 samples (configurable)
-- **Overwrite Mode**: Enabled (prevents data loss)
+### Software Notes
+- Sampling rate mặc định của từng sensor được cấu hình trong `imu_manager.c`.
+- `DATA_BUFFER_SIZE` và chính sách ghi đè cấu hình tại `data_buffer.h`.
+- Có thể tinh chỉnh trực tiếp trong mã và flash lại firmware.
 
 ## 📊 Performance Optimization
 
@@ -165,10 +130,9 @@ Update GPIO pins in `main/main.c` if needed:
 - **Memory Management**: Efficient circular buffer implementation
 
 ### Web Server Optimization
-- **Chunked Transfer**: Efficient data streaming
-- **Compression**: Gzip compression for static files
-- **Caching**: Browser caching for static resources
-- **WebSocket**: Real-time data streaming
+- **Chunked Transfer**: REST responses hỗ trợ chunk
+- **Streaming nhẹ**: Dashboard nhận dữ liệu nhỏ gọn cho biểu đồ
+- **Data export**: Bộ nhớ động để tránh lỗi stack khi tải dữ liệu lớn
 
 ## 🔍 Monitoring and Debugging
 
@@ -195,15 +159,6 @@ int64_t start_time = esp_timer_get_time();
 int64_t end_time = esp_timer_get_time();
 ESP_LOGI("PERF", "Operation took %lld us", end_time - start_time);
 ```
-
-## 🚀 Quick Start for Web Dashboard
-
-[VI] Bắt đầu nhanh với Dashboard Web
-
-1. Flash firmware and connect ESP32-C6 to your WiFi.
-2. Open a browser and navigate to `http://<device-ip>/`.
-3. The built-in HTML/JS dashboard (served from firmware) will render a realtime accelerometer chart using WebSocket.
-4. Advanced UI can be served from SPIFFS by uploading your own `index.html` to `/spiffs`.
 
 ## 🛠️ Troubleshooting
 
