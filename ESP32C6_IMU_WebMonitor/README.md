@@ -105,13 +105,13 @@ Update GPIO pins in `main/main.c` if needed:
 #define PIN_NUM_MISO_2          2
 #define PIN_NUM_MOSI_2          7
 #define PIN_NUM_CLK_2           6
-#define PIN_NUM_CS_2            5
+#define PIN_NUM_CS_2            20
 
 // SCL3300 (SPI)
 #define PIN_NUM_MISO_3          2
 #define PIN_NUM_MOSI_3          7
 #define PIN_NUM_CLK_3           6
-#define PIN_NUM_CS_3            20
+#define PIN_NUM_CS_3            11
 ```
 
 ### Software Notes
