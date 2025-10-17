@@ -26,10 +26,13 @@ class BLEHandler:
         self.notify_char: Optional[BleakGATTCharacteristic] = None
 
     async def scan(self, timeout: float = 4.0) -> List[DeviceInfo]:
-        devices = await BleakScanner.discover(timeout=timeout)
+        devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
         result = []
-        for d in devices:
-            result.append(DeviceInfo(name=d.name or "(unknown)", address=d.address, rssi=d.rssi or 0))
+        for address, (device, adv_data) in devices.items():
+            # Get RSSI from advertisement data
+            rssi = adv_data.rssi if hasattr(adv_data, 'rssi') else 0
+            name = device.name or adv_data.local_name or "(unknown)"
+            result.append(DeviceInfo(name=name, address=address, rssi=rssi))
         result.sort(key=lambda x: x.rssi, reverse=True)
         return result
 
@@ -51,7 +54,8 @@ class BLEHandler:
         if not (self.client and self.client.is_connected):
             raise BleakError("Not connected to any device.")
         chars = []
-        services = await self.client.get_services()
+        # Use services property directly (newer bleak API)
+        services = self.client.services
         for svc in services:
             for ch in svc.characteristics:
                 if "notify" in ch.properties:

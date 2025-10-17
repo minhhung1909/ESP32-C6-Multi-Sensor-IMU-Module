@@ -1,30 +1,33 @@
 @echo off
-REM Quick launcher for BLE IMU Dashboard on Windows
+REM ESP32-C6 Multi-Sensor IMU Dashboard Launcher
+REM Batch script for Windows
 
 echo.
-echo ===================================
-echo   BLE IMU Dashboard Launcher
-echo ===================================
+echo ========================================
+echo  ESP32-C6 IMU Dashboard Launcher
+echo ========================================
 echo.
 
-if not exist "venv\Scripts\activate.bat" (
+REM Check if .venv exists
+if not exist ".\.venv\Scripts\activate.bat" (
     echo [ERROR] Virtual environment not found!
-    echo.
-    echo Please run setup first:
-    echo   py -m venv venv
-    echo   .\venv\Scripts\Activate.ps1
-    echo   pip install -r requirements.txt
-    echo.
-    pause
-    exit /b 1
+    echo Creating .venv...
+    python -m venv .venv
+    
+    echo Installing dependencies...
+    call .\.venv\Scripts\activate.bat
+    pip install -r requirements.txt
 )
 
-echo [INFO] Activating virtual environment...
-call venv\Scripts\activate.bat
+REM Activate virtual environment
+echo Activating virtual environment...
+call .\.venv\Scripts\activate.bat
 
-echo [INFO] Starting BLE IMU Dashboard...
+REM Run the application
+echo Launching dashboard...
 python main.py
 
-echo.
-echo [INFO] Application closed.
+REM Deactivate when done
+call deactivate
+
 pause

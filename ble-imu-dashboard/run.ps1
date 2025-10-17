@@ -1,28 +1,26 @@
-# Quick launcher for BLE IMU Dashboard on Windows (PowerShell)
+# ESP32-C6 Multi-Sensor IMU Dashboard Launcher
+# PowerShell script to activate venv and run the application
 
-Write-Host ""
-Write-Host "===================================" -ForegroundColor Cyan
-Write-Host "  BLE IMU Dashboard Launcher" -ForegroundColor Cyan
-Write-Host "===================================" -ForegroundColor Cyan
-Write-Host ""
+Write-Host "🚀 Starting ESP32-C6 IMU Dashboard..." -ForegroundColor Cyan
 
-if (-Not (Test-Path "venv\Scripts\Activate.ps1")) {
-    Write-Host "[ERROR] Virtual environment not found!" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Please run setup first:"
-    Write-Host "  py -m venv venv"
-    Write-Host "  .\venv\Scripts\Activate.ps1"
-    Write-Host "  pip install -r requirements.txt"
-    Write-Host ""
-    pause
-    exit 1
+# Check if .venv exists
+if (-not (Test-Path ".\.venv\Scripts\Activate.ps1")) {
+    Write-Host "❌ Virtual environment not found!" -ForegroundColor Red
+    Write-Host "Creating .venv..." -ForegroundColor Yellow
+    python -m venv .venv
+    
+    Write-Host "Installing dependencies..." -ForegroundColor Yellow
+    .\.venv\Scripts\Activate.ps1
+    pip install -r requirements.txt
 }
 
-Write-Host "[INFO] Activating virtual environment..." -ForegroundColor Green
-& "venv\Scripts\Activate.ps1"
+# Activate virtual environment
+Write-Host "🔧 Activating virtual environment..." -ForegroundColor Green
+.\.venv\Scripts\Activate.ps1
 
-Write-Host "[INFO] Starting BLE IMU Dashboard..." -ForegroundColor Green
+# Run the application
+Write-Host "📊 Launching dashboard..." -ForegroundColor Green
 python main.py
 
-Write-Host ""
-Write-Host "[INFO] Application closed." -ForegroundColor Yellow
+# Deactivate when done
+deactivate

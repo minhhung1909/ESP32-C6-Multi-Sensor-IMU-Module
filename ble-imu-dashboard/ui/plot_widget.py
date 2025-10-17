@@ -6,7 +6,7 @@ import numpy as np
 
 class PlotWidget(QWidget):
     """Realtime plot widget for one sensor axis."""
-    def __init__(self, title="Sensor Stream", color='y', maxlen=2000):
+    def __init__(self, title="Sensor Stream", color='y', maxlen=500):
         super().__init__()
         layout = QVBoxLayout(self)
         self.plot = pg.PlotWidget(title=title)
@@ -26,3 +26,10 @@ class PlotWidget(QWidget):
             return
         self.curve.setData(np.fromiter(self.data_x, float),
                            np.fromiter(self.data_y, float))
+
+    def reset(self):
+        """Reset plot data and timer"""
+        self.data_x.clear()
+        self.data_y.clear()
+        self.t0 = perf_counter()
+        self.curve.clear()
