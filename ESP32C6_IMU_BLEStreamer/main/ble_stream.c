@@ -8,6 +8,7 @@
 #include "esp_gatt_common_api.h"
 #include "esp_log.h"
 #include <string.h>
+#include "led_status.h"
 
 static const char *TAG = "BLE_STREAM";
 

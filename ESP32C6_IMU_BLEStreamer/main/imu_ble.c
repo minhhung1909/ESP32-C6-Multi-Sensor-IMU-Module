@@ -204,11 +204,11 @@ static void producer_task(void *arg)
         if (ret == ESP_OK) {
             size_t len = build_frame(&sample, frame, sizeof(frame));
             if (len > 0) {
+                led_on();
                 esp_err_t ble_ret = ble_stream_notify(frame, (uint16_t)len);
-                if (ble_ret == ESP_OK) {
-                    // Data transmitted successfully - pulse LED
-                    led_status_streaming_pulse();
-                } else if (ble_ret != ESP_ERR_INVALID_STATE) {
+                led_off();
+
+                if (ble_ret != ESP_OK && ble_ret != ESP_ERR_INVALID_STATE) {
                     log_error_throttled("BLE notify failed", ble_ret);
                 }
             }
@@ -261,7 +261,7 @@ static esp_err_t configure_sensors(void)
 void imu_ble_on_ble_connect(void)
 {
     s_connected = true;
-    led_status_set_state(LED_STATUS_CONNECTED);
+    led_start_blink();  // Start blinking when connected
     ESP_LOGI(TAG, "Central connected");
 }
 
@@ -270,7 +270,8 @@ void imu_ble_on_ble_disconnect(void)
     s_connected = false;
     s_notifications_ready = false;
     request_stream_restart();
-    led_status_set_state(LED_STATUS_DISCONNECTED);
+    led_stop_blink();
+    led_on();  // Solid ON when disconnected
     ESP_LOGI(TAG, "Central disconnected");
 }
 
@@ -279,10 +280,11 @@ void imu_ble_on_notifications_changed(bool enabled)
     s_notifications_ready = enabled;
     if (enabled) {
         request_stream_restart();
-        led_status_set_state(LED_STATUS_STREAMING);
+        led_stop_blink();  // Stop blinking, let producer task control LED
+        led_off();  // Start with LED off
         ESP_LOGI(TAG, "Notifications enabled, streaming resumes");
     } else {
-        led_status_set_state(LED_STATUS_CONNECTED);
+        led_start_blink();  // Resume blinking when not streaming
         ESP_LOGI(TAG, "Notifications disabled, streaming paused");
     }
 }

@@ -21,8 +21,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Starting BLE IMU streamer");
 
-    // Init LED status indicator (GPIO18, active-low, 500ms blink)
-    ESP_ERROR_CHECK(led_status_init(NULL));  // Use defaults
+    ESP_ERROR_CHECK(led_status_init());
 
     // Init BLE stack
     ESP_ERROR_CHECK(ble_stream_init());
