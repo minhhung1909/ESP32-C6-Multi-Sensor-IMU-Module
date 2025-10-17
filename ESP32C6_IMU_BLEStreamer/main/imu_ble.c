@@ -1,6 +1,7 @@
 #include "imu_ble.h"
 #include "ble_stream.h"
 #include "imu_manager.h"
+#include "led_status.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -204,7 +205,10 @@ static void producer_task(void *arg)
             size_t len = build_frame(&sample, frame, sizeof(frame));
             if (len > 0) {
                 esp_err_t ble_ret = ble_stream_notify(frame, (uint16_t)len);
-                if (ble_ret != ESP_OK && ble_ret != ESP_ERR_INVALID_STATE) {
+                if (ble_ret == ESP_OK) {
+                    // Data transmitted successfully - pulse LED
+                    led_status_streaming_pulse();
+                } else if (ble_ret != ESP_ERR_INVALID_STATE) {
                     log_error_throttled("BLE notify failed", ble_ret);
                 }
             }
@@ -257,6 +261,7 @@ static esp_err_t configure_sensors(void)
 void imu_ble_on_ble_connect(void)
 {
     s_connected = true;
+    led_status_set_state(LED_STATUS_CONNECTED);
     ESP_LOGI(TAG, "Central connected");
 }
 
@@ -265,6 +270,7 @@ void imu_ble_on_ble_disconnect(void)
     s_connected = false;
     s_notifications_ready = false;
     request_stream_restart();
+    led_status_set_state(LED_STATUS_DISCONNECTED);
     ESP_LOGI(TAG, "Central disconnected");
 }
 
@@ -273,8 +279,10 @@ void imu_ble_on_notifications_changed(bool enabled)
     s_notifications_ready = enabled;
     if (enabled) {
         request_stream_restart();
+        led_status_set_state(LED_STATUS_STREAMING);
         ESP_LOGI(TAG, "Notifications enabled, streaming resumes");
     } else {
+        led_status_set_state(LED_STATUS_CONNECTED);
         ESP_LOGI(TAG, "Notifications disabled, streaming paused");
     }
 }
@@ -284,12 +292,21 @@ esp_err_t imu_ble_init(const imu_ble_config_t *cfg)
     if (!cfg || cfg->packet_interval_ms == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    
+    // Validate minimum interval for FreeRTOS stability
+    if (cfg->packet_interval_ms < 10) {
+        ESP_LOGW(TAG, "packet_interval_ms=%u too low, using minimum 10ms", cfg->packet_interval_ms);
+        s_cfg = *cfg;
+        s_cfg.packet_interval_ms = 10;
+    } else {
+        s_cfg = *cfg;
+    }
+    
     if (s_producer_task) {
         ESP_LOGW(TAG, "imu_ble already initialised");
         return ESP_OK;
     }
 
-    s_cfg = *cfg;
     s_connected = false;
     s_notifications_ready = false;
     request_stream_restart();

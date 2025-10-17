@@ -4,6 +4,7 @@ idf_component_register(
         "ble_stream.c"
         "imu_ble.c"
         "imu_manager.c"
+        "led_status.c"
         "sensors/iis2mdc.c"
         "sensors/iis3dwb.c"
         "sensors/icm45686.c"
