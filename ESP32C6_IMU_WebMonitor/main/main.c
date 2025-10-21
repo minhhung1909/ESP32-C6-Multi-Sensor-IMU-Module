@@ -11,10 +11,12 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_spiffs.h"
+#include "mdns.h"
 
 #include "web_server.h"
 #include "imu_manager.h"
 #include "data_buffer.h"
+#include "led_status.h"
 
 static const char *TAG = "MAIN";
 
@@ -22,6 +24,10 @@ static const char *TAG = "MAIN";
 #define WIFI_SSID                   "Titan"
 #define WIFI_PASS                   "stm32f103rd"
 #define WIFI_MAXIMUM_RETRY          5
+
+// mDNS configuration
+#define MDNS_HOSTNAME               "hbq-imu"
+#define MDNS_INSTANCE               "HBQ IMU Web Monitor"
 
 // Task priorities
 #define IMU_TASK_PRIORITY           5
@@ -42,8 +48,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        led_status_set_state(LED_STATUS_NO_WIFI);  // LED ON - đang kết nối
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        led_status_set_state(LED_STATUS_NO_WIFI);  // LED ON - mất kết nối
         if (s_retry_num < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
@@ -58,6 +66,23 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
+}
+
+static void mdns_init_service(void)
+{
+    // Initialize mDNS
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(MDNS_HOSTNAME));
+    ESP_LOGI(TAG, "mDNS hostname set to: %s.local", MDNS_HOSTNAME);
+    
+    ESP_ERROR_CHECK(mdns_instance_name_set(MDNS_INSTANCE));
+    
+    // Add HTTP service
+    ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0));
+    ESP_LOGI(TAG, "mDNS service added: _http._tcp on port 80");
+    
+    // Set LED to blink state after mDNS is configured
+    led_status_set_state(LED_STATUS_WIFI_CONNECTED);
 }
 
 void wifi_init_sta(void)
@@ -114,9 +139,13 @@ void wifi_init_sta(void)
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  WIFI_SSID, WIFI_PASS);
+        
+        // Initialize mDNS after WiFi connected
+        mdns_init_service();
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
                  WIFI_SSID, WIFI_PASS);
+        led_status_set_state(LED_STATUS_NO_WIFI);
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
@@ -136,7 +165,7 @@ static void imu_task(void *pvParameters)
     
     imu_data_t sensor_data;
     TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(100); // 10Hz sampling (reduced from 100Hz to avoid watchdog)
+    const TickType_t frequency = pdMS_TO_TICKS(50); // 10Hz sampling (reduced from 100Hz to avoid watchdog)
     uint32_t read_count = 0;
     
     while (1) {
@@ -244,6 +273,10 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    
+    // Initialize LED status indicator
+    ESP_ERROR_CHECK(led_status_init(18));  // GPIO 18
+    led_status_set_state(LED_STATUS_NO_WIFI);  // Start with NO_WIFI
     
     // Initialize data buffer
     data_buffer_init();

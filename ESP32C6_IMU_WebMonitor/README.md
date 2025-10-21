@@ -18,6 +18,8 @@ A high-performance web-based monitoring system for multiple IMU sensors with rea
 - **Data Export**: CSV and JSON download capabilities
 - **Remote Configuration**: Web-based sensor configuration interface
 - **Performance Monitoring**: Built-in statistics and performance metrics
+- **mDNS Support**: Access via `hbq-imu.local` instead of IP address
+- **LED Status Indicator**: Visual feedback for WiFi and data transmission status
 
 ## 🎯 Supported Sensors
 
@@ -60,7 +62,8 @@ idf.py flash monitor
 ```
 
 4. **Access web interface**:
-Open browser and navigate to the ESP32's IP address (check serial monitor for IP)
+   - Via mDNS: `http://hbq-imu.local` (recommended)
+   - Via IP address: Check serial monitor for IP (IP có thể thay đổi)
 
 ## 🌐 Web Interface
 
@@ -118,6 +121,26 @@ Update GPIO pins in `main/main.c` if needed:
 - Sampling rate mặc định của từng sensor được cấu hình trong `imu_manager.c`.
 - `DATA_BUFFER_SIZE` và chính sách ghi đè cấu hình tại `data_buffer.h`.
 - Có thể tinh chỉnh trực tiếp trong mã và flash lại firmware.
+
+### LED Status Indicator (GPIO 18)
+
+[VI] Đèn LED báo trạng thái (GPIO 18, Active-LOW)
+
+LED trên GPIO 18 hiển thị trạng thái hệ thống:
+
+| Trạng thái | LED Behavior | Mô tả |
+|-----------|--------------|-------|
+| **NO_WIFI** | 🔴 Sáng liên tục | Chưa kết nối WiFi |
+| **WIFI_CONNECTED** | 💚 Chớp 0.5s | Đã có WiFi và mDNS (hbq-imu.local) |
+| **DATA_SENDING** | 🟢 Sáng | Đang gửi dữ liệu qua WebSocket |
+| **DATA_IDLE** | ⚫ Tắt | Không gửi dữ liệu |
+
+**Chu kỳ hoạt động:**
+1. Boot → LED sáng (đang kết nối WiFi)
+2. WiFi connected → LED chớp 0.5s (sẵn sàng, truy cập http://hbq-imu.local)
+3. Khi gửi dữ liệu → LED sáng ngay khi bắt đầu gửi gói tin
+4. Gửi xong → LED tắt ngay
+5. Lặp lại bước 3-4 theo chu kỳ broadcast (~50Hz)
 
 ## 📊 Performance Optimization
 

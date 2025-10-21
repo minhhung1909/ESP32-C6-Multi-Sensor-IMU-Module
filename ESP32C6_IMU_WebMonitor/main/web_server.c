@@ -1,8 +1,10 @@
 #include "web_server.h"
 #include "data_buffer.h"
 #include "imu_manager.h"
+#include "led_status.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_netif.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
@@ -27,6 +29,7 @@ static SemaphoreHandle_t ws_mutex = NULL;
 static esp_err_t api_data_handler(httpd_req_t *req);
 static esp_err_t api_stats_handler(httpd_req_t *req);
 static esp_err_t api_download_handler(httpd_req_t *req);
+static esp_err_t api_ip_handler(httpd_req_t *req);
 static void ws_register_connection(int fd);
 static esp_err_t file_handler(httpd_req_t *req);
 static void ws_register_connection(int fd);
@@ -34,6 +37,28 @@ static void ws_unregister_connection(int fd);
 static esp_err_t ws_send_to_all(const char *data, size_t len);
 static void ws_broadcast_task(void *arg);
 static esp_err_t root_handler(httpd_req_t *req);
+// API IP endpoint - returns current IP address as JSON
+static esp_err_t api_ip_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "API IP request received");
+    esp_netif_ip_info_t ip_info;
+    char ip_str[32] = {0};
+    esp_netif_t *netif = esp_netif_get_default_netif();
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+            esp_ip4_addr1(&ip_info.ip), esp_ip4_addr2(&ip_info.ip), esp_ip4_addr3(&ip_info.ip), esp_ip4_addr4(&ip_info.ip));
+        ESP_LOGI(TAG, "Returning IP: %s", ip_str);
+    } else {
+        strcpy(ip_str, "0.0.0.0");
+        ESP_LOGW(TAG, "Failed to get IP, returning 0.0.0.0");
+    }
+    char json[64];
+    snprintf(json, sizeof(json), "{\"ip\":\"%s\"}", ip_str);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
 
 // API Data endpoint - returns latest sensor data
 static esp_err_t api_data_handler(httpd_req_t *req)
@@ -423,25 +448,67 @@ static void ws_register_connection(int fd)
             if (!ws_connections[i].active) {
                 ws_connections[i].fd = fd;
                 ws_connections[i].active = true;
-                ESP_LOGI(TAG, "WebSocket connection registered: fd=%d", fd);
+                ESP_LOGI(TAG, "WebSocket connection registered: fd=%d at slot %d", fd, i);
+                
+                // Send IP address to client as a simple JSON message
+                char ip_msg[64];
+                esp_netif_ip_info_t ip_info;
+                esp_netif_t *netif = esp_netif_get_default_netif();
+                if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                    snprintf(ip_msg, sizeof(ip_msg), "{\"ip\":\"%d.%d.%d.%d\"}",
+                        esp_ip4_addr1(&ip_info.ip), esp_ip4_addr2(&ip_info.ip), esp_ip4_addr3(&ip_info.ip), esp_ip4_addr4(&ip_info.ip));
+                    ESP_LOGI(TAG, "Sending IP to WebSocket client: %s", ip_msg);
+                } else {
+                    strcpy(ip_msg, "{\"ip\":\"0.0.0.0\"}");
+                    ESP_LOGW(TAG, "Failed to get IP for WebSocket client");
+                }
+                httpd_ws_frame_t frame = {
+                    .type = HTTPD_WS_TYPE_TEXT,
+                    .payload = (uint8_t *)ip_msg,
+                    .len = strlen(ip_msg)
+                };
+                httpd_ws_send_frame_async(server, fd, &frame);
                 break;
             }
         }
+        
+        // Count active connections
+        int active_count = 0;
+        for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
+            if (ws_connections[i].active) {
+                active_count++;
+            }
+        }
+        
         xSemaphoreGive(ws_mutex);
+        
+        // Switch LED to data transmission mode when first client connects
+        if (active_count == 1) {
+            led_status_set_state(LED_STATUS_DATA_IDLE);
+            ESP_LOGI(TAG, "First WebSocket client connected - LED switched to data mode");
+        }
     }
 }
 
 static void ws_unregister_connection(int fd)
 {
     if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int active_count = 0;
         for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
             if (ws_connections[i].active && ws_connections[i].fd == fd) {
                 ws_connections[i].active = false;
                 ESP_LOGI(TAG, "WebSocket connection unregistered: fd=%d", fd);
-                break;
+            } else if (ws_connections[i].active) {
+                active_count++;
             }
         }
         xSemaphoreGive(ws_mutex);
+        
+        // Switch LED back to WiFi connected mode when last client disconnects
+        if (active_count == 0) {
+            led_status_set_state(LED_STATUS_WIFI_CONNECTED);
+            ESP_LOGI(TAG, "All WebSocket clients disconnected - LED switched back to WiFi mode");
+        }
     }
 }
 
@@ -504,7 +571,7 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_data_uri);
-        
+
         httpd_uri_t api_stats_uri = {
             .uri = API_STATS_PATH,
             .method = HTTP_GET,
@@ -512,7 +579,7 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_stats_uri);
-        
+
         httpd_uri_t api_config_uri = {
             .uri = API_CONFIG_PATH,
             .method = HTTP_GET,
@@ -528,7 +595,7 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_config_post_uri);
-        
+
         httpd_uri_t api_download_uri = {
             .uri = API_DOWNLOAD_PATH,
             .method = HTTP_GET,
@@ -536,15 +603,16 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_download_uri);
-        
-        // Root handler serves an embedded dashboard when SPIFFS is not populated
-        httpd_uri_t root_uri = {
-            .uri = "/",
+
+        // Register /api/ip endpoint
+        httpd_uri_t api_ip_uri = {
+            .uri = API_IP_PATH,
             .method = HTTP_GET,
-            .handler = root_handler,
+            .handler = api_ip_handler,
             .user_ctx = NULL
         };
-        httpd_register_uri_handler(server, &root_uri);
+        esp_err_t ip_reg_result = httpd_register_uri_handler(server, &api_ip_uri);
+        ESP_LOGI(TAG, "Registered /api/ip endpoint: %s (result: %d)", API_IP_PATH, ip_reg_result);
 
         // WebSocket endpoint for realtime data
         httpd_uri_t ws_data_uri = {
@@ -555,8 +623,17 @@ esp_err_t web_server_start(void)
             .is_websocket = true
         };
         httpd_register_uri_handler(server, &ws_data_uri);
+        
+        // Root handler serves an embedded dashboard when SPIFFS is not populated
+        httpd_uri_t root_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &root_uri);
 
-        // File handler for static content under /spiffs
+        // File handler for static content under /spiffs - MUST BE LAST
         httpd_uri_t file_uri = {
             .uri = "/*",
             .method = HTTP_GET,
@@ -627,6 +704,9 @@ static void ws_broadcast_task(void *arg)
     for (;;) {
         imu_data_t d;
         if (data_buffer_get_latest(&d) == ESP_OK) {
+            // LED ON - bắt đầu gửi dữ liệu
+            led_status_data_pulse_start();
+            
             uint64_t now_us = (d.timestamp_us != 0) ? d.timestamp_us : esp_timer_get_time();
             if (rate_window_start_us == 0 || now_us <= rate_window_start_us) {
                 rate_window_start_us = now_us;
@@ -683,6 +763,9 @@ static void ws_broadcast_task(void *arg)
             ws_send_to_all(json, n);
             send_count++;
             
+            // LED OFF - gửi xong dữ liệu
+            led_status_data_pulse_end();
+            
             // Log every 100 sends
             if (send_count % 100 == 0) {
                 ESP_LOGI(TAG, "Sent %lu WebSocket messages (no_data: %lu)", send_count, no_data_count);
@@ -700,26 +783,46 @@ static void ws_broadcast_task(void *arg)
 // Simple embedded HTML dashboard (served at "/")
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    static const char *html =
+    // Get IP address
+    char ip_str[32] = "0.0.0.0";
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *netif = esp_netif_get_default_netif();
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+            esp_ip4_addr1(&ip_info.ip), esp_ip4_addr2(&ip_info.ip), 
+            esp_ip4_addr3(&ip_info.ip), esp_ip4_addr4(&ip_info.ip));
+    }
+    
+    ESP_LOGI(TAG, "Root handler - ESP32 IP: %s", ip_str);
+    
+    // Log thêm để xác nhận địa chỉ IP
+    ESP_LOGW(TAG, "### INJECTING IP: '%s' INTO HTML ###", ip_str);
+    
+    // HTML - part 1 (before IP injection)
+    static const char *html_part1 =
         "<!DOCTYPE html>"
         "<html><head><meta charset='utf-8'><title>ESP32-C6 IMU Monitor</title>"
         "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
         "<style>"
         "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f8fafc;color:#1e293b}"
         "h2{color:#0369a1;margin-bottom:12px}"
-        ".status{padding:12px;border-left:4px solid #10b981;background:#fff;margin:12px 0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+        ".status{padding:12px;border-left:4px solid #10b981;background:#fff;margin:12px 0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1);display:flex;justify-content:space-between;align-items:center;}"
+        ".status-ip{font-size:14px;color:#64748b;margin-left:auto;text-align:right;font-weight:bold;min-width:100px;}"
         ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:20px 0}"
         ".metric{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}"
         ".metric .label{display:block;font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.05em}"
-        ".metric .value{display:block;font-size:20px;font-weight:600;margin-top:6px;color:#0f172a}"
+        ".metric .value{display:block;font-size:20px;font-weight:600;margin-top:6px;color:#0f172a;}"
         ".chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;margin:18px 0}"
         ".chart-box{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
         ".chart-box h3{margin:0 0 10px 0;color:#0284c7;font-size:15px}"
         "canvas{width:100%!important;height:220px!important;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px}"
         ".log{background:#fff;padding:12px;height:160px;overflow:auto;border:1px solid #e2e8f0;border-radius:6px;font-family:monospace;font-size:11px;color:#475569}"
         "</style></head><body>"
-        "<h2>ESP32-C6 IMU Web Monitor</h2>"
-        "<div class='status' id='status'>Connecting...</div>"
+        "<h2>ESP32-C6 IMU Monitor (IP: ";
+    
+    // HTML - ip part (inject IP directly into HTML tag)
+    static const char *html_ip_part = ")</h2>"
+        "<div class='status' id='status'><span id='statusText'>Connecting...</span><span class='status-ip' id='statusIp'></span></div>"
         "<div class='metrics'>"
         "  <div class='metric'><span class='label'>Messages</span><span class='value' id='metricMsg'>0</span></div>"
         "  <div class='metric'><span class='label'>Active Sensors</span><span class='value' id='metricSensors'>0</span></div>"
@@ -729,8 +832,19 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<h3 style='color:#0284c7;margin-top:24px;'>Event Log</h3>"
         "<div class='log' id='log'></div>"
         "<script>"
+        "const ESP32_IP='";
+    
+    // HTML - part 2 (after IP injection)
+    static const char *html_part2 =
+        "';"
         "(()=>{"
         "  const statusEl=document.getElementById('status');"
+        "  const statusText=document.getElementById('statusText');"
+        "  const statusIp=document.getElementById('statusIp');"
+        "  statusIp.textContent=ESP32_IP;"
+        "  statusIp.style.display='inline-block';"
+        "  console.log('ESP32 IP set to:', ESP32_IP);"
+        "  document.title = 'ESP32-C6 - ' + ESP32_IP;"
         "  const logEl=document.getElementById('log');"
         "  const chartsContainer=document.getElementById('charts');"
         "  const metrics={"
@@ -768,17 +882,24 @@ static esp_err_t root_handler(httpd_req_t *req)
         "    if(chart.data.labels.length>maxPoints){chart.data.labels.shift();chart.data.datasets.forEach(ds=>ds.data.shift());}"
         "    chart.update('none');"
         "  }"
+        "  addLog('ESP32 IP: '+ESP32_IP);"
         "  addLog('Waiting for sensor data...');"
         "  const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/data';"
         "  addLog('Connecting to '+wsUrl);"
         "  const ws=new WebSocket(wsUrl);"
-        "  ws.onopen=()=>{addLog('WebSocket connected');statusEl.textContent='Connected';statusEl.style.borderLeftColor='#10b981';statusEl.style.background='#fff';};"
-        "  ws.onerror=()=>{addLog('WebSocket error');statusEl.textContent='Error';statusEl.style.borderLeftColor='#ef4444';statusEl.style.background='#fef2f2';};"
-        "  ws.onclose=()=>{addLog('WebSocket closed');statusEl.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b';statusEl.style.background='#fffbeb';};"
+        "  ws.onopen=()=>{"
+        "    addLog('WebSocket connected');"
+        "    statusText.textContent='Connected';"
+        "    statusEl.style.borderLeftColor='#10b981';"
+        "    statusEl.style.background='#fff';"
+        "  };"
+        "  ws.onerror=()=>{addLog('WebSocket error');statusText.textContent='Error';statusEl.style.borderLeftColor='#ef4444';statusEl.style.background='#fef2f2';};"
+        "  ws.onclose=()=>{addLog('WebSocket closed');statusText.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b';statusEl.style.background='#fffbeb';};"
         "  ws.onmessage=(ev)=>{"
-        "    msgCount++;"
         "    try{"
         "      const payload=JSON.parse(ev.data);"
+        "      if(payload.ip){statusIp.textContent=payload.ip;return;}"
+        "      msgCount++;"
         "      metrics.msg.textContent=msgCount;"
         "      if(payload&&payload.statistics&&payload.statistics.msg_per_second!==undefined){metrics.msgRate.textContent=payload.statistics.msg_per_second.toFixed(1);}"
         "      if(payload.mag_iis2){pushValues('mag_iis2',{values:[payload.mag_iis2.x,payload.mag_iis2.y,payload.mag_iis2.z],name:payload.mag_iis2.name,unit:payload.mag_iis2.unit});}"
@@ -791,8 +912,15 @@ static esp_err_t root_handler(httpd_req_t *req)
         "  };"
         "})();"
         "</script>"
-        "</body></html>"
-        "";
+        "</body></html>";
+    
+    // Send HTML in chunks with IP injected twice (in title and as JavaScript)
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, html_part1, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, ip_str, HTTPD_RESP_USE_STRLEN);  // IP trong tiêu đề
+    httpd_resp_send_chunk(req, html_ip_part, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, html_part2, HTTPD_RESP_USE_STRLEN); 
+    httpd_resp_send_chunk(req, NULL, 0); // End of chunks
+    
+    return ESP_OK;
 }

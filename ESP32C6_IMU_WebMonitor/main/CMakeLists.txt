@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" 
+idf_component_register(SRCS "led_status.c" "main.c" 
                               "web_server.c" 
                               "imu_manager.c"
                               "data_buffer.c"
@@ -17,4 +17,4 @@ idf_component_register(SRCS "main.c"
                               "imu/inv_imu_edmp_compass.c"
                               "imu/inv_imu_edmp_wearable.c"
                     INCLUDE_DIRS "." "sensors" "imu"
-                    REQUIRES esp_http_server esp_wifi nvs_flash spiffs json driver esp_timer)
+                    REQUIRES esp_http_server esp_wifi nvs_flash spiffs json driver esp_timer espressif__mdns)
