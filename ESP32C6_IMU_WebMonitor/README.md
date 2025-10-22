@@ -82,6 +82,7 @@ idf.py flash monitor
 #### Data Access
 - `GET /api/data` – Trả snapshot giá trị sensor mới nhất
 - `GET /api/stats` – Trả thống kê buffer và thông lượng
+- `GET /api/ip` – Trả địa chỉ IP
 - `GET /api/download?format=csv` – Xuất dữ liệu vòng đệm (CSV)
 - `GET /api/download?format=json` – Xuất dữ liệu vòng đệm (JSON)
 
@@ -132,8 +133,7 @@ LED trên GPIO 18 hiển thị trạng thái hệ thống:
 |-----------|--------------|-------|
 | **NO_WIFI** | 🔴 Sáng liên tục | Chưa kết nối WiFi |
 | **WIFI_CONNECTED** | 💚 Chớp 0.5s | Đã có WiFi và mDNS (hbq-imu.local) |
-| **DATA_SENDING** | 🟢 Sáng | Đang gửi dữ liệu qua WebSocket |
-| **DATA_IDLE** | ⚫ Tắt | Không gửi dữ liệu |
+| **DATA_SENDING** | 🟢 Chớp | Chu kì gửi dữ liệu |
 
 **Chu kỳ hoạt động:**
 1. Boot → LED sáng (đang kết nối WiFi)
