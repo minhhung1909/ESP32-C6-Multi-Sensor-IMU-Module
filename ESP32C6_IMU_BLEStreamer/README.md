@@ -12,8 +12,6 @@ A BLE 5 (2M PHY + DLE) GATT server that streams real sensor data (IIS2MDC, IIS3D
 - Một đặc tả GATT (Notify) cho streaming tốc độ cao
 - Có thể bật/tắt từng cảm biến: IIS2MDC (mag), IIS3DWB (accel), ICM45686 (accel+gyro), SCL3300 (inclinometer)
 - Cấu hình ODR, interval, enable/disable từng sensor qua `imu_ble_config_t`
-- Dữ liệu thực từ cảm biến, không còn mô phỏng
-- Gói BLE có header, mask cảm biến, version, sequence, timestamp, và dữ liệu cảm biến thực tế
 
 ## Directory
 
