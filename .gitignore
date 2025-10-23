@@ -16,4 +16,6 @@ ESP32C6_IMU_BLEStreamer/sdkconfig.old
 
 ESP32C6_IMU_WebMonitor/build
 ESP32C6_IMU_WebMonitor/sdkconfig.old
+ESP32C6_IMU_WebMonitor/managed_components
+
 program
