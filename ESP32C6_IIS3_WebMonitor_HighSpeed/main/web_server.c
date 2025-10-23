@@ -1,12 +1,15 @@
 #include "web_server.h"
 #include "data_buffer.h"
 #include "imu_manager.h"
+#include "led_status.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "esp_netif.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 
 static const char *TAG = "WEB_SERVER";
@@ -14,8 +17,8 @@ static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server = NULL;
 static httpd_handle_t ws_server = NULL;
 
-#define WS_PLOT_CHUNK_SAMPLES      10
-#define WS_PLOT_BUFFER_CAPACITY    6000
+#define WS_PLOT_CHUNK_SAMPLES      100
+#define WS_PLOT_BUFFER_CAPACITY    10000
 #define WS_RECENT_MAX_SAMPLES      IMU_MANAGER_MAX_SAMPLES
 
 // WebSocket connection tracking
@@ -35,13 +38,25 @@ static esp_err_t api_data_handler(httpd_req_t *req);
 static esp_err_t api_stats_handler(httpd_req_t *req);
 static esp_err_t api_config_handler(httpd_req_t *req);
 static esp_err_t api_download_handler(httpd_req_t *req);
+static esp_err_t api_ip_handler(httpd_req_t *req);
 static esp_err_t ws_data_handler(httpd_req_t *req);
 static esp_err_t ws_control_handler(httpd_req_t *req);
 static esp_err_t file_handler(httpd_req_t *req);
+static esp_err_t style_handler(httpd_req_t *req);
+static esp_err_t app_js_handler(httpd_req_t *req);
 static void ws_register_connection(int fd);
 static void ws_unregister_connection(int fd);
+static bool ws_has_active_clients(void);
 static esp_err_t ws_send_to_all(const char *data, size_t len);
 static void ws_broadcast_task(void *arg);
+// Embedded files
+extern const uint8_t index_html_start[] asm("_binary_index_html_start");
+extern const uint8_t index_html_end[] asm("_binary_index_html_end");
+extern const uint8_t style_css_start[] asm("_binary_style_css_start");
+extern const uint8_t style_css_end[] asm("_binary_style_css_end");
+extern const uint8_t app_js_start[] asm("_binary_app_js_start");
+extern const uint8_t app_js_end[] asm("_binary_app_js_end");
+
 static esp_err_t root_handler(httpd_req_t *req);
 
 // API Data endpoint - returns latest sensor data
@@ -76,7 +91,6 @@ static esp_err_t api_data_handler(httpd_req_t *req)
     cJSON_AddItemToObject(json, "accelerometer_ms2", accel_ms2);
 
     cJSON *stats = cJSON_CreateObject();
-    cJSON_AddNumberToObject(stats, "fifo_level", data.stats.fifo_level);
     cJSON_AddNumberToObject(stats, "samples_read", data.stats.samples_read);
     cJSON_AddNumberToObject(stats, "batch_interval_us", data.stats.batch_interval_us);
     cJSON_AddNumberToObject(stats, "samples_per_second", data.stats.samples_per_second);
@@ -150,15 +164,92 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "API Config request");
     
     if (req->method == HTTP_POST) {
+        char buf[128] = {0};
+        int total_len = req->content_len;
+        if (total_len <= 0 || total_len >= (int)sizeof(buf)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "{\"error\":\"invalid_length\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+
+        int received = 0;
+        while (received < total_len) {
+            int r = httpd_req_recv(req, buf + received, total_len - received);
+            if (r <= 0) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_send(req, "{\"error\":\"recv_failed\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_FAIL;
+            }
+            received += r;
+        }
+        buf[received] = '\0';
+
+        cJSON *root = cJSON_Parse(buf);
+        if (root == NULL) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "{\"error\":\"invalid_json\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+
+        cJSON *fs_item = cJSON_GetObjectItem(root, "full_scale_g");
+        if (!cJSON_IsNumber(fs_item)) {
+            cJSON_Delete(root);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "{\"error\":\"missing_full_scale\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+
+        int requested_fs = (int)fs_item->valuedouble;
+        imu_manager_full_scale_t scale = IMU_MANAGER_FS_2G;
+        switch (requested_fs) {
+            case 2:
+                scale = IMU_MANAGER_FS_2G;
+                break;
+            case 4:
+                scale = IMU_MANAGER_FS_4G;
+                break;
+            case 8:
+                scale = IMU_MANAGER_FS_8G;
+                break;
+            case 16:
+                scale = IMU_MANAGER_FS_16G;
+                break;
+            default:
+                cJSON_Delete(root);
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_send(req, "{\"error\":\"unsupported_full_scale\"}", HTTPD_RESP_USE_STRLEN);
+                return ESP_FAIL;
+        }
+
+        esp_err_t ret = imu_manager_set_full_scale(scale);
+        cJSON_Delete(root);
+        if (ret != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_send(req, "{\"error\":\"apply_failed\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddNumberToObject(resp, "full_scale_g", (double)requested_fs);
+        cJSON_AddNumberToObject(resp, "imu_full_scale_g", (double)imu_manager_get_full_scale_g());
+        char *resp_str = cJSON_PrintUnformatted(resp);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-        httpd_resp_send(req, "{\"status\":\"read-only\"}", HTTPD_RESP_USE_STRLEN);
+        if (resp_str) {
+            httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+            free(resp_str);
+        } else {
+            httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+        }
+        cJSON_Delete(resp);
         return ESP_OK;
     }
 
     cJSON *json = cJSON_CreateObject();
     /* Do not include imu_odr_hz here to keep UI focused on actual plotted points/sec */
     cJSON_AddNumberToObject(json, "imu_fifo_watermark", imu_manager_get_fifo_watermark());
+    cJSON_AddNumberToObject(json, "imu_full_scale_g", imu_manager_get_full_scale_g());
 
     char *json_string = cJSON_Print(json);
     if (json_string != NULL) {
@@ -226,6 +317,31 @@ static esp_err_t api_download_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// API IP endpoint - returns current IP address as JSON
+static esp_err_t api_ip_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "API IP request received");
+
+    esp_netif_ip_info_t ip_info;
+    char ip_str[32] = "0.0.0.0";
+    esp_netif_t *netif = esp_netif_get_default_netif();
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+                 esp_ip4_addr1(&ip_info.ip), esp_ip4_addr2(&ip_info.ip),
+                 esp_ip4_addr3(&ip_info.ip), esp_ip4_addr4(&ip_info.ip));
+        ESP_LOGI(TAG, "Returning IP: %s", ip_str);
+    } else {
+        ESP_LOGW(TAG, "Failed to get IP, returning 0.0.0.0");
+    }
+
+    char json[64];
+    snprintf(json, sizeof(json), "{\"ip\":\"%s\"}", ip_str);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // WebSocket data handler
 static esp_err_t ws_data_handler(httpd_req_t *req)
 {
@@ -240,13 +356,25 @@ static esp_err_t ws_data_handler(httpd_req_t *req)
     // For incoming messages (optional control), just consume and ack
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-    if (httpd_ws_recv_frame(req, &ws_pkt, 0) == ESP_OK && ws_pkt.len) {
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to receive WS frame: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        int fd = httpd_req_to_sockfd(req);
+        ws_unregister_connection(fd);
+        ESP_LOGI(TAG, "WebSocket closed fd=%d", fd);
+        return ESP_OK;
+    }
+
+    if (ws_pkt.len) {
         uint8_t tmp_buf[64];
         ws_pkt.payload = tmp_buf;
         size_t to_read = ws_pkt.len < sizeof(tmp_buf) ? ws_pkt.len : sizeof(tmp_buf);
         httpd_ws_recv_frame(req, &ws_pkt, to_read);
-        // No-op; could parse control messages here
+        // Optional: parse control messages here
     }
     return ESP_OK;
 }
@@ -324,26 +452,82 @@ static void ws_register_connection(int fd)
             if (!ws_connections[i].active) {
                 ws_connections[i].fd = fd;
                 ws_connections[i].active = true;
-                ESP_LOGI(TAG, "WebSocket connection registered: fd=%d", fd);
+                ESP_LOGI(TAG, "WebSocket connection registered: fd=%d at slot %d", fd, i);
+
+                // Send IP address to client
+                char ip_msg[64];
+                esp_netif_ip_info_t ip_info;
+                esp_netif_t *netif = esp_netif_get_default_netif();
+                if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                    snprintf(ip_msg, sizeof(ip_msg), "{\"ip\":\"%d.%d.%d.%d\"}",
+                             esp_ip4_addr1(&ip_info.ip), esp_ip4_addr2(&ip_info.ip),
+                             esp_ip4_addr3(&ip_info.ip), esp_ip4_addr4(&ip_info.ip));
+                    ESP_LOGI(TAG, "Sending IP to WebSocket client: %s", ip_msg);
+                } else {
+                    strcpy(ip_msg, "{\"ip\":\"0.0.0.0\"}");
+                    ESP_LOGW(TAG, "Failed to get IP for WebSocket client");
+                }
+                httpd_ws_frame_t frame = {
+                    .type = HTTPD_WS_TYPE_TEXT,
+                    .payload = (uint8_t *)ip_msg,
+                    .len = strlen(ip_msg)
+                };
+                httpd_ws_send_frame_async(server, fd, &frame);
                 break;
             }
         }
+
+        // Count active connections
+        int active_count = 0;
+        for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
+            if (ws_connections[i].active) {
+                active_count++;
+            }
+        }
+
         xSemaphoreGive(ws_mutex);
+
+        if (active_count == 1) {
+            led_status_set_state(LED_STATUS_DATA_IDLE);
+            ESP_LOGI(TAG, "First WebSocket client connected - LED set to data mode");
+        }
     }
 }
 
 static void ws_unregister_connection(int fd)
 {
     if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int active_count = 0;
         for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
             if (ws_connections[i].active && ws_connections[i].fd == fd) {
                 ws_connections[i].active = false;
                 ESP_LOGI(TAG, "WebSocket connection unregistered: fd=%d", fd);
+            } else if (ws_connections[i].active) {
+                active_count++;
+            }
+        }
+        xSemaphoreGive(ws_mutex);
+
+        if (active_count == 0) {
+            led_status_set_state(LED_STATUS_WIFI_CONNECTED);
+            ESP_LOGI(TAG, "All WebSocket clients disconnected - LED back to WiFi state");
+        }
+    }
+}
+
+static bool ws_has_active_clients(void)
+{
+    bool has_clients = false;
+    if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
+            if (ws_connections[i].active) {
+                has_clients = true;
                 break;
             }
         }
         xSemaphoreGive(ws_mutex);
     }
+    return has_clients;
 }
 
 static esp_err_t ws_send_to_all(const char *data, size_t len)
@@ -359,8 +543,12 @@ static esp_err_t ws_send_to_all(const char *data, size_t len)
     if (xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < WEBSOCKET_MAX_CONNECTIONS; i++) {
             if (ws_connections[i].active) {
-                httpd_ws_send_frame_async(server, ws_connections[i].fd, &frame);
-                active_connections++;
+                esp_err_t r = httpd_ws_send_frame_async(server, ws_connections[i].fd, &frame);
+                if (r == ESP_OK) {
+                    active_connections++;
+                } else {
+                    ESP_LOGW(TAG, "WS send failed for fd=%d: %s", ws_connections[i].fd, esp_err_to_name(r));
+                }
             }
         }
         xSemaphoreGive(ws_mutex);
@@ -413,14 +601,30 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_stats_uri);
+
+        httpd_uri_t api_ip_uri = {
+            .uri = API_IP_PATH,
+            .method = HTTP_GET,
+            .handler = api_ip_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_ip_uri);
         
-        httpd_uri_t api_config_uri = {
+        httpd_uri_t api_config_get_uri = {
             .uri = API_CONFIG_PATH,
-            .method = HTTP_GET | HTTP_POST,
+            .method = HTTP_GET,
             .handler = api_config_handler,
             .user_ctx = NULL
         };
-        httpd_register_uri_handler(server, &api_config_uri);
+        httpd_register_uri_handler(server, &api_config_get_uri);
+
+        httpd_uri_t api_config_post_uri = {
+            .uri = API_CONFIG_PATH,
+            .method = HTTP_POST,
+            .handler = api_config_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_config_post_uri);
         
         httpd_uri_t api_download_uri = {
             .uri = API_DOWNLOAD_PATH,
@@ -430,7 +634,7 @@ esp_err_t web_server_start(void)
         };
         httpd_register_uri_handler(server, &api_download_uri);
         
-        // Root handler serves an embedded dashboard when SPIFFS is not populated
+        // Root handler serves embedded HTML
         httpd_uri_t root_uri = {
             .uri = "/",
             .method = HTTP_GET,
@@ -438,6 +642,24 @@ esp_err_t web_server_start(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &root_uri);
+
+        // CSS file
+        httpd_uri_t style_uri = {
+            .uri = "/style.css",
+            .method = HTTP_GET,
+            .handler = style_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &style_uri);
+
+        // JavaScript file
+        httpd_uri_t app_js_uri = {
+            .uri = "/app.js",
+            .method = HTTP_GET,
+            .handler = app_js_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &app_js_uri);
 
         // WebSocket endpoint for realtime data
         httpd_uri_t ws_data_uri = {
@@ -528,6 +750,13 @@ static void ws_broadcast_task(void *arg)
         uint16_t fetched = imu_manager_copy_recent_samples(temp_x, temp_y, temp_z,
                                                            WS_RECENT_MAX_SAMPLES,
                                                            &batch_ts, &fifo_level, &seq_id);
+        if (fetched == 0) {
+            static uint32_t no_sample_log = 0;
+            if ((no_sample_log++ % 200) == 0) {
+                ESP_LOGW(TAG, "No new IIS3DWB samples available from manager");
+            }
+        }
+        // Only skip if we've seen data before AND sequence hasn't changed
         if (fetched > 0 && (!sequence_init || seq_id != last_sequence)) {
             sequence_init = true;
             last_sequence = seq_id;
@@ -596,15 +825,12 @@ static void ws_broadcast_task(void *arg)
             sensor_sps = plot_point_rate;
         }
 
-    /* keep ws_msg_rate and ws_samples_rate as the window-averaged values
-     * (updated above when window_span >= 1s). Do not overwrite them with
-     * per-message instantaneous values to ensure displayed pts/s is the
-     * measured points-per-second drawn on the graph. */
-
         size_t head = ring_head;
         float last_chunk_x = 0.0f;
         float last_chunk_y = 0.0f;
         float last_chunk_z = 0.0f;
+
+        uint8_t full_scale_g = imu_manager_get_full_scale_g();
 
         int n = snprintf(json_buf, sizeof(json_buf), "{\"t\":%llu,\"chunks\":{\"x\":[",
                          (unsigned long long)(last_timestamp ? last_timestamp : now_us));
@@ -633,21 +859,33 @@ static void ws_broadcast_task(void *arg)
 
     n += snprintf(json_buf + n, sizeof(json_buf) - n,
               "]},\"mag\":%.5f,\"s\":{\"fifo\":%u,\"batch\":%u,"
-                      "\"sps\":%.2f,\"pps\":%.2f,\"mps\":%.2f,\"chunk\":%u}}",
+                      "\"sps\":%.2f,\"pps\":%.2f,\"mps\":%.2f,\"chunk\":%u},\"fs\":%u}",
               chunk_mag,
               last_fifo_level,
               last_batch_samples,
               sensor_sps,
                       ws_samples_rate,
                       ws_msg_rate,
-              chunk);
+              chunk,
+              (unsigned int)full_scale_g);
 
         ring_head = (ring_head + chunk) % WS_PLOT_BUFFER_CAPACITY;
         ring_size -= chunk;
 
         if (n > 0 && n < (int)sizeof(json_buf)) {
-            ws_send_to_all(json_buf, (size_t)n);
-            ws_total_messages++;
+            bool has_clients = ws_has_active_clients();
+            if (has_clients) {
+                led_status_data_pulse_start();
+            }
+            esp_err_t send_ret = ws_send_to_all(json_buf, (size_t)n);
+            if (send_ret == ESP_OK) {
+                ws_total_messages++;
+            } else {
+                ESP_LOGW(TAG, "Failed to enqueue WS frame: %s", esp_err_to_name(send_ret));
+            }
+            if (has_clients) {
+                led_status_data_pulse_end();
+            }
         }
 
         vTaskDelayUntil(&last_wake, broadcast_period);
@@ -657,84 +895,27 @@ static void ws_broadcast_task(void *arg)
 // Simple embedded HTML dashboard (served at "/")
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    static const char *html =
-        "<!DOCTYPE html>"
-        "<html><head><meta charset='utf-8'><title>IIS3DWB Web Monitor</title>"
-        "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
-        "<style>"
-        "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f8fafc;color:#1e293b}"
-        "h2{color:#0369a1;margin-bottom:12px}"
-        ".status{padding:12px;border-left:4px solid #10b981;background:#fff;margin:12px 0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
-        ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}"
-        ".metric{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
-        ".metric .label{display:block;font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:0.05em}"
-        ".metric .value{display:block;font-size:20px;font-weight:600;margin-top:6px;color:#0f172a}"
-        ".chart-box{background:#fff;padding:12px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
-        ".chart-box h3{margin:0 0 10px 0;color:#0284c7;font-size:15px}"
-        "canvas{width:100%!important;height:240px!important;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px}"
-        ".log{background:#fff;padding:12px;height:160px;overflow:auto;border:1px solid #e2e8f0;border-radius:6px;font-family:monospace;font-size:11px;color:#334155}"
-        "a{color:#0369a1}"
-        "</style></head><body>"
-        "<h2>ESP32-C6 IIS3DWB High-Speed Monitor</h2>"
-        "<div class='status' id='status'>Connecting...</div>"
-        "<div class='metrics'>"
-        "  <div class='metric'><span class='label'>Plot pts/s</span><span class='value' id='metricMsg'>-</span></div>"
-        "  <div class='metric'><span class='label'>Sensor samples/s</span><span class='value' id='metricSamples'>-</span></div>"
-        "  <div class='metric'><span class='label'>FIFO level</span><span class='value' id='metricFifo'>-</span></div>"
-        "  <div class='metric'><span class='label'>Batch size</span><span class='value' id='metricBatch'>-</span></div>"
-        "  <div class='metric'><span class='label'>|g|</span><span class='value' id='metricMag'>-</span></div>"
-        "</div>"
-        "<div class='chart-box'><h3>IIS3DWB Acceleration (g)</h3><canvas id='chartG'></canvas></div>"
-        "<h3 style='color:#38bdf8;margin-top:24px;'>Event Log</h3>"
-        "<div class='log' id='log'></div>"
-        "<script>"
-        "(()=>{"
-        "  const statusEl=document.getElementById('status');"
-        "  const logEl=document.getElementById('log');"
-        "  const metrics={"
-        "    msg:document.getElementById('metricMsg'),"
-        "    samples:document.getElementById('metricSamples'),"
-        "    fifo:document.getElementById('metricFifo'),"
-        "    batch:document.getElementById('metricBatch'),"
-        "    mag:document.getElementById('metricMag')"
-        "  };"
-        "  const ctx=document.getElementById('chartG').getContext('2d');"
-        "  const maxPoints=200;"
-        "  const chart=new Chart(ctx,{"
-        "    type:'line',"
-        "    data:{labels:[],datasets:["
-        "      {label:'X',data:[],borderColor:'#ef4444',borderWidth:1.5,pointRadius:0},"
-        "      {label:'Y',data:[],borderColor:'#10b981',borderWidth:1.5,pointRadius:0},"
-        "      {label:'Z',data:[],borderColor:'#3b82f6',borderWidth:1.5,pointRadius:0}"
-        "    ]},"
-        "    options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{display:false},y:{beginAtZero:false,grid:{color:'rgba(226,232,240,0.8)'}}},plugins:{legend:{labels:{color:'#1e293b'}}}}"
-        "  });"
-        "  let sampleIndex=0;"
-        "  function addLog(msg){const t=new Date().toLocaleTimeString();logEl.innerHTML='['+t+'] '+msg+'<br>'+logEl.innerHTML;const parts=logEl.innerHTML.split('<br>');if(parts.length>160){logEl.innerHTML=parts.slice(0,160).join('<br>');}}"
-        "  function formatNumber(val, digits){if(val===null||val===undefined||!isFinite(val)) return '-';return Number(val).toFixed(digits);}"
-        "  function pushValues(payload){const chunk=payload&&payload.chunks?payload.chunks:null;if(!chunk||!chunk.x)return;const len=Math.min(chunk.x.length, chunk.y.length, chunk.z.length);for(let i=0;i<len;i++){if(chart.data.labels.length>=maxPoints){chart.data.labels.shift();chart.data.datasets[0].data.shift();chart.data.datasets[1].data.shift();chart.data.datasets[2].data.shift();}chart.data.labels.push(sampleIndex++);chart.data.datasets[0].data.push(chunk.x[i]);chart.data.datasets[1].data.push(chunk.y[i]);chart.data.datasets[2].data.push(chunk.z[i]);}chart.update('none');if(payload&&payload.mag!==undefined){metrics.mag.textContent=formatNumber(payload.mag,3);}}"
-    "  function updateMetrics(payload){const stats=payload && payload.s ? payload.s : {};metrics.msg.textContent=formatNumber(stats.pps!==undefined?stats.pps:stats.mps,1);metrics.samples.textContent=formatNumber(stats.sps,0);metrics.fifo.textContent=stats.fifo!==undefined?stats.fifo:'-';metrics.batch.textContent=stats.batch!==undefined?stats.batch:'-';if(payload&&payload.mag!==undefined){metrics.mag.textContent=formatNumber(payload.mag,3);}statusEl.textContent='Connected — '+formatNumber((stats.pps!==undefined?stats.pps:(stats.mps!==undefined?stats.mps:0)),1)+' pts/s';}"
-        "  addLog('Waiting for IIS3DWB data...');"
-        "  const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/data';"
-        "  addLog('Connecting to '+wsUrl);"
-        "  const ws=new WebSocket(wsUrl);"
-        "  ws.onopen=()=>{addLog('WebSocket connected');statusEl.style.borderLeftColor='#10b981';statusEl.style.background='#fff';};"
-        "  ws.onerror=()=>{addLog('WebSocket error');statusEl.textContent='Error';statusEl.style.borderLeftColor='#ef4444';statusEl.style.background='#fef2f2';};"
-        "  ws.onclose=()=>{addLog('WebSocket closed');statusEl.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b';statusEl.style.background='#fffbeb';};"
-        "  let msgCounter=0;"
-        "  ws.onmessage=(ev)=>{"
-        "    try{"
-        "      const payload=JSON.parse(ev.data);"
-        "      pushValues(payload);"
-        "      updateMetrics(payload);"
-        "      msgCounter++;"
-        "      if(msgCounter%200===0){const stats=payload && payload.s ? payload.s : {};addLog('Plot '+formatNumber(stats.pps!==undefined?stats.pps:(stats.mps||0),1)+' pts/s (msg '+formatNumber(stats.mps||0,1)+'), sensor '+formatNumber(stats.sps||0,0)+' samples/s');}"
-        "    }catch(err){addLog('Parse error: '+err.message);}"
-        "  };"
-        "})();"
-        "</script>"
-        "</body></html>"
-        "";
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    
+    httpd_resp_send(req, (const char *)index_html_start, index_html_end - index_html_start);
+    return ESP_OK;
+}
+
+static esp_err_t style_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/css");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000");
+    httpd_resp_send(req, (const char *)style_css_start, style_css_end - style_css_start);
+    return ESP_OK;
+}
+
+static esp_err_t app_js_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000");
+    httpd_resp_send(req, (const char *)app_js_start, app_js_end - app_js_start);
+    return ESP_OK;
 }

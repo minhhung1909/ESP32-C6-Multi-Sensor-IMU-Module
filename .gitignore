@@ -8,6 +8,8 @@ ble-imu-dashboard/test_ble_scan.py
 
 ESP32C6_IIS3_WebMonitor_HighSpeed/.vscode
 ESP32C6_IIS3_WebMonitor_HighSpeed/build
+ESP32C6_IIS3_WebMonitor_HighSpeed/managed_components
+
 ESP32C6_IIS3DWBTR Test/.vscode
 
 ESP32C6_IMU_BLEStreamer/.vscode
@@ -16,4 +18,5 @@ ESP32C6_IMU_BLEStreamer/sdkconfig.old
 
 ESP32C6_IMU_WebMonitor/build
 ESP32C6_IMU_WebMonitor/sdkconfig.old
+ESP32C6_IMU_WebMonitor/managed_components
 program
