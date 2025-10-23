@@ -12,17 +12,23 @@
 #include "esp_netif.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
+#include "mdns.h"
 
 #include "web_server.h"
 #include "imu_manager.h"
 #include "data_buffer.h"
+#include "led_status.h"
 
 static const char *TAG = "MAIN";
 
 // WiFi credentials - change these for your network
-#define WIFI_SSID                   "your_SSID"
-#define WIFI_PASS                   "your_Password"
+#define WIFI_SSID                   "Titan"
+#define WIFI_PASS                   "stm32f103rd"
 #define WIFI_MAXIMUM_RETRY          5
+
+// mDNS configuration
+#define MDNS_HOSTNAME               "hbq-imu"
+#define MDNS_INSTANCE               "HBQ IMU High-Speed Monitor"
 
 // Task priorities
 #define IMU_TASK_PRIORITY           5
@@ -43,8 +49,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        led_status_set_state(LED_STATUS_NO_WIFI);  // LED ON - đang kết nối
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        led_status_set_state(LED_STATUS_NO_WIFI);  // LED ON - mất kết nối
         if (s_retry_num < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
@@ -59,6 +67,23 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
+}
+
+static void mdns_init_service(void)
+{
+    // Initialize mDNS
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(MDNS_HOSTNAME));
+    ESP_LOGI(TAG, "mDNS hostname set to: %s.local", MDNS_HOSTNAME);
+    
+    ESP_ERROR_CHECK(mdns_instance_name_set(MDNS_INSTANCE));
+    
+    // Add HTTP service
+    ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0));
+    ESP_LOGI(TAG, "mDNS service added: _http._tcp on port 80");
+    
+    // Set LED to blink state after mDNS is configured
+    led_status_set_state(LED_STATUS_WIFI_CONNECTED);
 }
 
 void wifi_init_sta(void)
@@ -115,9 +140,13 @@ void wifi_init_sta(void)
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  WIFI_SSID, WIFI_PASS);
+        
+        // Initialize mDNS after WiFi connected
+        mdns_init_service();
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
                  WIFI_SSID, WIFI_PASS);
+        led_status_set_state(LED_STATUS_NO_WIFI);
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
@@ -136,69 +165,18 @@ static void imu_task(void *pvParameters)
     
     imu_data_t sensor_data;
     TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(1);
+    const TickType_t frequency = pdMS_TO_TICKS(1);  // 1ms - Polling mode reads 1 sample per call (~1000 samples/s max)
     const TickType_t tick_delay = (frequency > 0) ? frequency : 1;
-    uint32_t batch_count = 0;
-    uint32_t sample_accumulator = 0;
-    uint64_t stats_window_start = esp_timer_get_time();
     
     while (1) {
         if (imu_manager_read_all(&sensor_data) == ESP_OK) {
             data_buffer_add(&sensor_data);
-            batch_count++;
-            sample_accumulator += sensor_data.stats.samples_read;
-
-            uint64_t now = sensor_data.timestamp_us;
-            if (now - stats_window_start >= 1000000UL) {
-                float elapsed_s = (now - stats_window_start) / 1000000.0f;
-                float msg_per_sec = batch_count / elapsed_s;
-                float samples_per_sec = sample_accumulator / elapsed_s;
-                ESP_LOGI(TAG,
-                         "IMU %.1f msg/s, %.1f samples/s, |g|=%.3f (fifo=%u, batch=%u)",
-                         msg_per_sec,
-                         samples_per_sec,
-                         sensor_data.accelerometer.magnitude_g,
-                         sensor_data.stats.fifo_level,
-                         sensor_data.stats.samples_read);
-                batch_count = 0;
-                sample_accumulator = 0;
-                stats_window_start = now;
-            }
         } else {
             ESP_LOGW(TAG, "Failed to read IMU data");
             vTaskDelay(pdMS_TO_TICKS(5));
         }
         
         vTaskDelayUntil(&last_wake_time, tick_delay);
-    }
-}
-
-// Data processing task
-static void data_processor_task(void *pvParameters)
-{
-    ESP_LOGI(TAG, "Data processor task started");
-    
-    imu_data_t data;
-    uint32_t processed_count = 0;
-    
-    while (1) {
-        // Process data from buffer (use get_latest to not consume/delete data)
-        // This allows ws_broadcast_task to also read the same data
-        if (data_buffer_get_latest(&data) == ESP_OK) {
-            // Calculate statistics, apply filters, etc.
-            processed_count++;
-            
-            // Log statistics every 1000 samples
-            if (processed_count % 1000 == 0) {
-                ESP_LOGI(TAG, "Processed %lu samples", processed_count);
-            }
-        } else {
-            // Buffer empty, wait longer to avoid busy-waiting
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        
-        // Always yield to other tasks
-        vTaskDelay(pdMS_TO_TICKS(100)); // Slow background analytics
     }
 }
 
@@ -245,7 +223,7 @@ static void web_server_task(void *pvParameters)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-C6 IMU Web Monitor Starting...");
+    ESP_LOGI(TAG, "ESP32-C6 IIS3DWB High-Speed Web Monitor Starting...");
     
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -255,6 +233,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     
+    // Initialize LED status indicator
+    ESP_ERROR_CHECK(led_status_init(18));  // GPIO 18
+    led_status_set_state(LED_STATUS_NO_WIFI);  // Start with NO_WIFI
+    
     // Initialize data buffer
     data_buffer_init();
     
@@ -262,17 +244,8 @@ void app_main(void)
     wifi_init_sta();
     
     // Create tasks
-    // ESP32-C6 is single-core, use core 0 or tskNO_AFFINITY
-    xTaskCreatePinnedToCore(imu_task, "imu_task", IMU_TASK_STACK_SIZE, 
-                           NULL, IMU_TASK_PRIORITY, NULL, 0);
-    
-    xTaskCreatePinnedToCore(data_processor_task, "data_processor", 
-                           DATA_PROCESSOR_STACK_SIZE, NULL, 
-                           DATA_PROCESSOR_PRIORITY, NULL, 0);
-    
-    xTaskCreatePinnedToCore(web_server_task, "web_server", 
-                           WEB_SERVER_TASK_STACK_SIZE, NULL, 
-                           WEB_SERVER_TASK_PRIORITY, NULL, 0);
+    xTaskCreate(imu_task, "imu_task", IMU_TASK_STACK_SIZE, NULL, IMU_TASK_PRIORITY, NULL);
+    xTaskCreate(web_server_task, "web_server", WEB_SERVER_TASK_STACK_SIZE, NULL, WEB_SERVER_TASK_PRIORITY, NULL);
     
     ESP_LOGI(TAG, "All tasks created successfully");
     

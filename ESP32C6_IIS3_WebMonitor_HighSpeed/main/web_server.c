@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "data_buffer.h"
 #include "imu_manager.h"
+#include "led_status.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
@@ -14,8 +15,6 @@ static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server = NULL;
 static httpd_handle_t ws_server = NULL;
 
-#define WS_PLOT_CHUNK_SAMPLES      10
-#define WS_PLOT_BUFFER_CAPACITY    6000
 #define WS_RECENT_MAX_SAMPLES      IMU_MANAGER_MAX_SAMPLES
 
 // WebSocket connection tracking
@@ -29,6 +28,7 @@ static SemaphoreHandle_t ws_mutex = NULL;
 static volatile float ws_msg_rate = 0.0f;
 static volatile float ws_samples_rate = 0.0f;
 static volatile uint32_t ws_total_messages = 0;
+static volatile bool ws_streaming_paused = false; // Pause/Resume control
 
 // Forward declarations
 static esp_err_t api_data_handler(httpd_req_t *req);
@@ -76,7 +76,6 @@ static esp_err_t api_data_handler(httpd_req_t *req)
     cJSON_AddItemToObject(json, "accelerometer_ms2", accel_ms2);
 
     cJSON *stats = cJSON_CreateObject();
-    cJSON_AddNumberToObject(stats, "fifo_level", data.stats.fifo_level);
     cJSON_AddNumberToObject(stats, "samples_read", data.stats.samples_read);
     cJSON_AddNumberToObject(stats, "batch_interval_us", data.stats.batch_interval_us);
     cJSON_AddNumberToObject(stats, "samples_per_second", data.stats.samples_per_second);
@@ -150,15 +149,71 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "API Config request");
     
     if (req->method == HTTP_POST) {
+        char buf[128];
+        int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (ret <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read request body");
+            return ESP_FAIL;
+        }
+        buf[ret] = '\0';
+        
+        cJSON *json = cJSON_Parse(buf);
+        if (json == NULL) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+            return ESP_FAIL;
+        }
+        
+        cJSON *response = cJSON_CreateObject();
+        bool changed = false;
+        
+        // Handle pause/resume
+        cJSON *pause = cJSON_GetObjectItem(json, "pause");
+        if (pause && cJSON_IsBool(pause)) {
+            ws_streaming_paused = cJSON_IsTrue(pause);
+            cJSON_AddBoolToObject(response, "paused", ws_streaming_paused);
+            ESP_LOGI(TAG, "Streaming %s", ws_streaming_paused ? "PAUSED" : "RESUMED");
+            changed = true;
+        }
+        
+        // Handle full scale change
+        cJSON *fs = cJSON_GetObjectItem(json, "full_scale");
+        if (fs && cJSON_IsNumber(fs)) {
+            uint8_t fs_code = (uint8_t)fs->valueint;
+            if (fs_code <= 3) {
+                esp_err_t err = imu_manager_set_full_scale(fs_code);
+                if (err == ESP_OK) {
+                    cJSON_AddNumberToObject(response, "full_scale", fs_code);
+                    changed = true;
+                } else {
+                    cJSON_AddStringToObject(response, "error", "Failed to set full scale");
+                }
+            } else {
+                cJSON_AddStringToObject(response, "error", "Invalid full scale value");
+            }
+        }
+        
+        if (!changed) {
+            cJSON_AddStringToObject(response, "status", "no_changes");
+        } else {
+            cJSON_AddStringToObject(response, "status", "ok");
+        }
+        
+        char *json_string = cJSON_Print(response);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-        httpd_resp_send(req, "{\"status\":\"read-only\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, json_string, strlen(json_string));
+        
+        free(json_string);
+        cJSON_Delete(response);
+        cJSON_Delete(json);
         return ESP_OK;
     }
 
+    // GET request - return current config
     cJSON *json = cJSON_CreateObject();
-    /* Do not include imu_odr_hz here to keep UI focused on actual plotted points/sec */
     cJSON_AddNumberToObject(json, "imu_fifo_watermark", imu_manager_get_fifo_watermark());
+    cJSON_AddNumberToObject(json, "full_scale", imu_manager_get_full_scale());
+    cJSON_AddBoolToObject(json, "paused", ws_streaming_paused);
 
     char *json_string = cJSON_Print(json);
     if (json_string != NULL) {
@@ -167,12 +222,10 @@ static esp_err_t api_config_handler(httpd_req_t *req)
         httpd_resp_send(req, json_string, strlen(json_string));
         free(json_string);
     }
-
+    
     cJSON_Delete(json);
     return ESP_OK;
-}
-
-// API Download endpoint - returns data in various formats
+}// API Download endpoint - returns data in various formats
 static esp_err_t api_download_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "API Download request");
@@ -262,7 +315,7 @@ static esp_err_t ws_control_handler(httpd_req_t *req)
     return ESP_FAIL;
 }
 
-// File handler for serving static files
+// File handler for serving static files from SPIFFS/web directory
 static esp_err_t file_handler(httpd_req_t *req)
 {
     const char *filepath = req->uri + 1; // Skip leading '/'
@@ -279,12 +332,17 @@ static esp_err_t file_handler(httpd_req_t *req)
         filepath = "index.html";
     }
     
-    // Build full path
-    char full_path[64];
-    snprintf(full_path, sizeof(full_path), "/spiffs/%s", filepath);
+    // Try web/ directory first (for separated HTML/CSS/JS files)
+    char full_path[96];
+    snprintf(full_path, sizeof(full_path), "/spiffs/web/%s", filepath);
     
-    // Open file
     FILE *file = fopen(full_path, "r");
+    if (file == NULL) {
+        // Fallback to /spiffs/ root
+        snprintf(full_path, sizeof(full_path), "/spiffs/%s", filepath);
+        file = fopen(full_path, "r");
+    }
+    
     if (file == NULL) {
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_send(req, "File not found", HTTPD_RESP_USE_STRLEN);
@@ -459,7 +517,6 @@ esp_err_t web_server_start(void)
         httpd_register_uri_handler(server, &file_uri);
         
         ESP_LOGI(TAG, "Web server started successfully");
-        // Start broadcaster task (~100 Hz)
         xTaskCreatePinnedToCore(ws_broadcast_task, "ws_broadcast", 4096, NULL, 4, NULL, 0);
         return ESP_OK;
     } else {
@@ -489,29 +546,20 @@ esp_err_t web_server_broadcast_data(const char *data, size_t len)
     return ws_send_to_all(data, len);
 }
 
-// Broadcast latest sample periodically as compact JSON
+// Broadcast latest sample periodically as compact JSON (polling mode - direct send)
 static void ws_broadcast_task(void *arg)
 {
     (void)arg;
-    static float ring_x[WS_PLOT_BUFFER_CAPACITY];
-    static float ring_y[WS_PLOT_BUFFER_CAPACITY];
-    static float ring_z[WS_PLOT_BUFFER_CAPACITY];
     static float temp_x[WS_RECENT_MAX_SAMPLES];
     static float temp_y[WS_RECENT_MAX_SAMPLES];
     static float temp_z[WS_RECENT_MAX_SAMPLES];
     static char json_buf[4096];
 
-    size_t ring_head = 0;
-    size_t ring_size = 0;
     uint32_t window_msgs = 0;
     uint32_t window_samples = 0;
     uint64_t window_start_us = esp_timer_get_time();
-    uint32_t last_sequence = 0;
-    bool sequence_init = false;
-    uint16_t last_fifo_level = 0;
     uint16_t last_batch_samples = 0;
     uint64_t last_timestamp = 0;
-    uint64_t last_send_time_us = 0;
 
     TickType_t last_wake = xTaskGetTickCount();
     TickType_t broadcast_period = pdMS_TO_TICKS(10);
@@ -519,46 +567,34 @@ static void ws_broadcast_task(void *arg)
         broadcast_period = 1;
     }
 
-    ESP_LOGI(TAG, "WebSocket broadcast task started");
+    ESP_LOGI(TAG, "WebSocket broadcast task started (polling mode)");
 
     for (;;) {
         uint64_t batch_ts = 0;
-        uint16_t fifo_level = 0;
+        uint16_t fifo_level = 0;  // Not used in polling mode, but kept for API compatibility
         uint32_t seq_id = 0;
+        
+        led_status_data_pulse_start();
+        
         uint16_t fetched = imu_manager_copy_recent_samples(temp_x, temp_y, temp_z,
                                                            WS_RECENT_MAX_SAMPLES,
                                                            &batch_ts, &fifo_level, &seq_id);
-        if (fetched > 0 && (!sequence_init || seq_id != last_sequence)) {
-            sequence_init = true;
-            last_sequence = seq_id;
-            last_fifo_level = fifo_level;
-            last_batch_samples = fetched;
-            last_timestamp = batch_ts;
-
-            for (uint16_t i = 0; i < fetched; ++i) {
-                size_t idx = (ring_head + ring_size) % WS_PLOT_BUFFER_CAPACITY;
-                ring_x[idx] = temp_x[i];
-                ring_y[idx] = temp_y[i];
-                ring_z[idx] = temp_z[i];
-                if (ring_size == WS_PLOT_BUFFER_CAPACITY) {
-                    ring_head = (ring_head + 1) % WS_PLOT_BUFFER_CAPACITY;
-                } else {
-                    ring_size++;
-                }
-            }
-        }
-
-        uint16_t available = (ring_size > UINT16_MAX) ? UINT16_MAX : (uint16_t)ring_size;
-        uint16_t chunk = available < WS_PLOT_CHUNK_SAMPLES ? available : WS_PLOT_CHUNK_SAMPLES;
-        if (chunk == 0) {
+        
+        if (fetched == 0) {
+            led_status_data_pulse_end();
             vTaskDelayUntil(&last_wake, broadcast_period);
             continue;
         }
+        
+        last_batch_samples = fetched;
+        last_timestamp = batch_ts;
 
-    imu_data_t d;
-    bool have_stats = (data_buffer_get_latest(&d) == ESP_OK) && d.accelerometer.valid;
-    float sensor_sps = have_stats ? d.stats.samples_per_second : 0.0f;
+        // Get sensor stats
+        imu_data_t d;
+        bool have_stats = (data_buffer_get_latest(&d) == ESP_OK) && d.accelerometer.valid;
+        float sensor_sps = have_stats ? d.stats.samples_per_second : 0.0f;
 
+        // Update window-based rate calculation
         uint64_t now_us = esp_timer_get_time();
         if (window_start_us == 0 || now_us <= window_start_us) {
             window_start_us = now_us;
@@ -567,41 +603,30 @@ static void ws_broadcast_task(void *arg)
         }
 
         window_msgs++;
-        window_samples += chunk;
+        window_samples += fetched;
 
         uint64_t window_span = now_us - window_start_us;
-        if (window_span >= 1000000ULL) {
-            ws_msg_rate = (window_msgs * 1000000.0f) / (float)window_span;
-            ws_samples_rate = (window_samples * 1000000.0f) / (float)window_span;
+        if (window_span >= 500000ULL) {
+            float new_msg_rate = (window_msgs * 1000000.0f) / (float)window_span;
+            float new_samples_rate = (window_samples * 1000000.0f) / (float)window_span;
+            
+            // Exponential moving average (EMA) for smooth display
+            if (ws_msg_rate == 0.0f) {
+                ws_msg_rate = new_msg_rate;
+                ws_samples_rate = new_samples_rate;
+            } else {
+                ws_msg_rate = ws_msg_rate * 0.7f + new_msg_rate * 0.3f;
+                ws_samples_rate = ws_samples_rate * 0.7f + new_samples_rate * 0.3f;
+            }
+            
             window_msgs = 0;
             window_samples = 0;
             window_start_us = now_us;
-            ESP_LOGI(TAG, "WS metrics: %.2f msg/s, %.0f points/s", ws_msg_rate, ws_samples_rate);
+            ESP_LOGI(TAG, "WS metrics: %.2f msg/s, %.0f points/s", 
+                     ws_msg_rate, ws_samples_rate);
         }
 
-        uint64_t send_now_us = esp_timer_get_time();
-        float delta_us = (last_send_time_us == 0 || send_now_us <= last_send_time_us)
-                         ? (float)broadcast_period * 1000.0f * portTICK_PERIOD_MS
-                         : (float)(send_now_us - last_send_time_us);
-        if (delta_us <= 0.0f) {
-            delta_us = (float)broadcast_period * 1000.0f * portTICK_PERIOD_MS;
-            if (delta_us <= 0.0f) {
-                delta_us = 10000.0f; // fallback 10 ms
-            }
-        }
-        float plot_msg_rate = 1000000.0f / delta_us;
-        float plot_point_rate = ((float)chunk * 1000000.0f) / delta_us;
-        last_send_time_us = send_now_us;
-        if (!have_stats) {
-            sensor_sps = plot_point_rate;
-        }
-
-    /* keep ws_msg_rate and ws_samples_rate as the window-averaged values
-     * (updated above when window_span >= 1s). Do not overwrite them with
-     * per-message instantaneous values to ensure displayed pts/s is the
-     * measured points-per-second drawn on the graph. */
-
-        size_t head = ring_head;
+        // Build JSON payload - send fetched samples directly (no ring buffer)
         float last_chunk_x = 0.0f;
         float last_chunk_y = 0.0f;
         float last_chunk_z = 0.0f;
@@ -609,60 +634,75 @@ static void ws_broadcast_task(void *arg)
         int n = snprintf(json_buf, sizeof(json_buf), "{\"t\":%llu,\"chunks\":{\"x\":[",
                          (unsigned long long)(last_timestamp ? last_timestamp : now_us));
 
-        for (uint16_t i = 0; i < chunk && n > 0 && n < (int)sizeof(json_buf); ++i) {
-            size_t idx = (head + i) % WS_PLOT_BUFFER_CAPACITY;
-            last_chunk_x = ring_x[idx];
-            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", ring_x[idx]);
+        for (uint16_t i = 0; i < fetched && n > 0 && n < (int)sizeof(json_buf); ++i) {
+            last_chunk_x = temp_x[i];
+            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", temp_x[i]);
         }
         n += snprintf(json_buf + n, sizeof(json_buf) - n, "],\"y\":[");
-        for (uint16_t i = 0; i < chunk && n > 0 && n < (int)sizeof(json_buf); ++i) {
-            size_t idx = (head + i) % WS_PLOT_BUFFER_CAPACITY;
-            last_chunk_y = ring_y[idx];
-            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", ring_y[idx]);
+        for (uint16_t i = 0; i < fetched && n > 0 && n < (int)sizeof(json_buf); ++i) {
+            last_chunk_y = temp_y[i];
+            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", temp_y[i]);
         }
         n += snprintf(json_buf + n, sizeof(json_buf) - n, "],\"z\":[");
-        for (uint16_t i = 0; i < chunk && n > 0 && n < (int)sizeof(json_buf); ++i) {
-            size_t idx = (head + i) % WS_PLOT_BUFFER_CAPACITY;
-            last_chunk_z = ring_z[idx];
-            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", ring_z[idx]);
+        for (uint16_t i = 0; i < fetched && n > 0 && n < (int)sizeof(json_buf); ++i) {
+            last_chunk_z = temp_z[i];
+            n += snprintf(json_buf + n, sizeof(json_buf) - n, i ? ",%.5f" : "%.5f", temp_z[i]);
         }
 
         float chunk_mag = sqrtf(last_chunk_x * last_chunk_x +
                                  last_chunk_y * last_chunk_y +
                                  last_chunk_z * last_chunk_z);
 
-    n += snprintf(json_buf + n, sizeof(json_buf) - n,
-              "]},\"mag\":%.5f,\"s\":{\"fifo\":%u,\"batch\":%u,"
-                      "\"sps\":%.2f,\"pps\":%.2f,\"mps\":%.2f,\"chunk\":%u}}",
-              chunk_mag,
-              last_fifo_level,
-              last_batch_samples,
-              sensor_sps,
-                      ws_samples_rate,
-                      ws_msg_rate,
-              chunk);
+        n += snprintf(json_buf + n, sizeof(json_buf) - n,
+                  "]},\"mag\":%.5f,\"s\":{\"batch\":%u,"
+                          "\"sps\":%.2f,\"pps\":%.2f,\"mps\":%.2f,\"chunk\":%u}}",
+                  chunk_mag, last_batch_samples,
+                  sensor_sps, ws_samples_rate, ws_msg_rate, fetched);
 
-        ring_head = (ring_head + chunk) % WS_PLOT_BUFFER_CAPACITY;
-        ring_size -= chunk;
-
-        if (n > 0 && n < (int)sizeof(json_buf)) {
+        // Send WebSocket message
+        if (!ws_streaming_paused && n > 0 && n < (int)sizeof(json_buf)) {
             ws_send_to_all(json_buf, (size_t)n);
             ws_total_messages++;
         }
+        
+        led_status_data_pulse_end();
 
         vTaskDelayUntil(&last_wake, broadcast_period);
     }
 }
 
-// Simple embedded HTML dashboard (served at "/")
+// Root handler - serves embedded dashboard HTML
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    static const char *html =
-        "<!DOCTYPE html>"
-        "<html><head><meta charset='utf-8'><title>IIS3DWB Web Monitor</title>"
+    // Try to serve index.html from SPIFFS first (if configured)
+    FILE *file = fopen("/spiffs/web/index.html", "r");
+    if (file == NULL) {
+        file = fopen("/spiffs/index.html", "r");
+    }
+    
+    if (file != NULL) {
+        // Found index.html - serve it
+        httpd_resp_set_type(req, "text/html");
+        char buffer[512];
+        size_t bytes_read;
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+            if (httpd_resp_send_chunk(req, buffer, bytes_read) != ESP_OK) {
+                break;
+            }
+        }
+        fclose(file);
+        httpd_resp_send_chunk(req, NULL, 0);
+        return ESP_OK;
+    }
+    
+    // No SPIFFS - serve embedded HTML dashboard
+    static const char *html_page = 
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>IIS3DWB Monitor</title>"
         "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
         "<style>"
-        "body{font-family:Arial,Helvetica,sans-serif;margin:20px;background:#f8fafc;color:#1e293b}"
+        "body{font-family:Arial,sans-serif;margin:20px;background:#f8fafc;color:#1e293b}"
         "h2{color:#0369a1;margin-bottom:12px}"
         ".status{padding:12px;border-left:4px solid #10b981;background:#fff;margin:12px 0;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
         ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}"
@@ -673,68 +713,47 @@ static esp_err_t root_handler(httpd_req_t *req)
         ".chart-box h3{margin:0 0 10px 0;color:#0284c7;font-size:15px}"
         "canvas{width:100%!important;height:240px!important;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px}"
         ".log{background:#fff;padding:12px;height:160px;overflow:auto;border:1px solid #e2e8f0;border-radius:6px;font-family:monospace;font-size:11px;color:#334155}"
-        "a{color:#0369a1}"
+        ".controls{background:#fff;padding:16px;margin:12px 0;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+        ".control-group{margin-bottom:12px}"
+        ".control-group:last-child{margin-bottom:0}"
+        ".control-group h4{margin:0 0 8px 0;color:#475569;font-size:13px;text-transform:uppercase;letter-spacing:0.05em}"
+        "button{padding:8px 16px;margin:4px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;color:#1e293b;cursor:pointer;font-size:13px;transition:all 0.2s}"
+        "button:hover{background:#f1f5f9;border-color:#94a3b8}"
+        "button.active{background:#0ea5e9;color:#fff;border-color:#0284c7}"
+        "button.paused{background:#ef4444;color:#fff;border-color:#dc2626}"
         "</style></head><body>"
         "<h2>ESP32-C6 IIS3DWB High-Speed Monitor</h2>"
         "<div class='status' id='status'>Connecting...</div>"
+        "<div class='controls'><div class='control-group'><h4>Streaming Control</h4>"
+        "<button id='btnPause' onclick='togglePause()'>Pause</button></div>"
+        "<div class='control-group'><h4>Full Scale Range (Sensor + Chart)</h4>"
+        "<button id='fs0' onclick='setFullScale(0,2)'>±2g</button>"
+        "<button id='fs1' onclick='setFullScale(1,4)' class='active'>±4g</button>"
+        "<button id='fs2' onclick='setFullScale(2,8)'>±8g</button>"
+        "<button id='fs3' onclick='setFullScale(3,16)'>±16g</button>"
+        "<button id='fsAuto' onclick='setFullScale(3,null)'>Auto Scale</button></div></div>"
         "<div class='metrics'>"
-        "  <div class='metric'><span class='label'>Plot pts/s</span><span class='value' id='metricMsg'>-</span></div>"
-        "  <div class='metric'><span class='label'>Sensor samples/s</span><span class='value' id='metricSamples'>-</span></div>"
-        "  <div class='metric'><span class='label'>FIFO level</span><span class='value' id='metricFifo'>-</span></div>"
-        "  <div class='metric'><span class='label'>Batch size</span><span class='value' id='metricBatch'>-</span></div>"
-        "  <div class='metric'><span class='label'>|g|</span><span class='value' id='metricMag'>-</span></div>"
-        "</div>"
+        "<div class='metric'><span class='label'>Hz</span><span class='value' id='metricMsg'>-</span></div>"
+        "<div class='metric'><span class='label'>Sensor samples/s</span><span class='value' id='metricSamples'>-</span></div>"
+        "<div class='metric'><span class='label'>|g|</span><span class='value' id='metricMag'>-</span></div></div>"
         "<div class='chart-box'><h3>IIS3DWB Acceleration (g)</h3><canvas id='chartG'></canvas></div>"
-        "<h3 style='color:#38bdf8;margin-top:24px;'>Event Log</h3>"
-        "<div class='log' id='log'></div>"
+        "<h3 style='color:#38bdf8;margin-top:24px'>Event Log</h3><div class='log' id='log'></div>"
         "<script>"
-        "(()=>{"
-        "  const statusEl=document.getElementById('status');"
-        "  const logEl=document.getElementById('log');"
-        "  const metrics={"
-        "    msg:document.getElementById('metricMsg'),"
-        "    samples:document.getElementById('metricSamples'),"
-        "    fifo:document.getElementById('metricFifo'),"
-        "    batch:document.getElementById('metricBatch'),"
-        "    mag:document.getElementById('metricMag')"
-        "  };"
-        "  const ctx=document.getElementById('chartG').getContext('2d');"
-        "  const maxPoints=200;"
-        "  const chart=new Chart(ctx,{"
-        "    type:'line',"
-        "    data:{labels:[],datasets:["
-        "      {label:'X',data:[],borderColor:'#ef4444',borderWidth:1.5,pointRadius:0},"
-        "      {label:'Y',data:[],borderColor:'#10b981',borderWidth:1.5,pointRadius:0},"
-        "      {label:'Z',data:[],borderColor:'#3b82f6',borderWidth:1.5,pointRadius:0}"
-        "    ]},"
-        "    options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{display:false},y:{beginAtZero:false,grid:{color:'rgba(226,232,240,0.8)'}}},plugins:{legend:{labels:{color:'#1e293b'}}}}"
-        "  });"
-        "  let sampleIndex=0;"
-        "  function addLog(msg){const t=new Date().toLocaleTimeString();logEl.innerHTML='['+t+'] '+msg+'<br>'+logEl.innerHTML;const parts=logEl.innerHTML.split('<br>');if(parts.length>160){logEl.innerHTML=parts.slice(0,160).join('<br>');}}"
-        "  function formatNumber(val, digits){if(val===null||val===undefined||!isFinite(val)) return '-';return Number(val).toFixed(digits);}"
-        "  function pushValues(payload){const chunk=payload&&payload.chunks?payload.chunks:null;if(!chunk||!chunk.x)return;const len=Math.min(chunk.x.length, chunk.y.length, chunk.z.length);for(let i=0;i<len;i++){if(chart.data.labels.length>=maxPoints){chart.data.labels.shift();chart.data.datasets[0].data.shift();chart.data.datasets[1].data.shift();chart.data.datasets[2].data.shift();}chart.data.labels.push(sampleIndex++);chart.data.datasets[0].data.push(chunk.x[i]);chart.data.datasets[1].data.push(chunk.y[i]);chart.data.datasets[2].data.push(chunk.z[i]);}chart.update('none');if(payload&&payload.mag!==undefined){metrics.mag.textContent=formatNumber(payload.mag,3);}}"
-    "  function updateMetrics(payload){const stats=payload && payload.s ? payload.s : {};metrics.msg.textContent=formatNumber(stats.pps!==undefined?stats.pps:stats.mps,1);metrics.samples.textContent=formatNumber(stats.sps,0);metrics.fifo.textContent=stats.fifo!==undefined?stats.fifo:'-';metrics.batch.textContent=stats.batch!==undefined?stats.batch:'-';if(payload&&payload.mag!==undefined){metrics.mag.textContent=formatNumber(payload.mag,3);}statusEl.textContent='Connected — '+formatNumber((stats.pps!==undefined?stats.pps:(stats.mps!==undefined?stats.mps:0)),1)+' pts/s';}"
-        "  addLog('Waiting for IIS3DWB data...');"
-        "  const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/data';"
-        "  addLog('Connecting to '+wsUrl);"
-        "  const ws=new WebSocket(wsUrl);"
-        "  ws.onopen=()=>{addLog('WebSocket connected');statusEl.style.borderLeftColor='#10b981';statusEl.style.background='#fff';};"
-        "  ws.onerror=()=>{addLog('WebSocket error');statusEl.textContent='Error';statusEl.style.borderLeftColor='#ef4444';statusEl.style.background='#fef2f2';};"
-        "  ws.onclose=()=>{addLog('WebSocket closed');statusEl.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b';statusEl.style.background='#fffbeb';};"
-        "  let msgCounter=0;"
-        "  ws.onmessage=(ev)=>{"
-        "    try{"
-        "      const payload=JSON.parse(ev.data);"
-        "      pushValues(payload);"
-        "      updateMetrics(payload);"
-        "      msgCounter++;"
-        "      if(msgCounter%200===0){const stats=payload && payload.s ? payload.s : {};addLog('Plot '+formatNumber(stats.pps!==undefined?stats.pps:(stats.mps||0),1)+' pts/s (msg '+formatNumber(stats.mps||0,1)+'), sensor '+formatNumber(stats.sps||0,0)+' samples/s');}"
-        "    }catch(err){addLog('Parse error: '+err.message);}"
-        "  };"
-        "})();"
-        "</script>"
-        "</body></html>"
-        "";
+        "(()=>{let isPaused=false,currentFullScale=0;const statusEl=document.getElementById('status'),logEl=document.getElementById('log'),btnPause=document.getElementById('btnPause'),metrics={msg:document.getElementById('metricMsg'),samples:document.getElementById('metricSamples'),mag:document.getElementById('metricMag')};"
+        "window.togglePause=()=>{isPaused=!isPaused;fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pause:isPaused})}).then(r=>r.json()).then(d=>{addLog(isPaused?'Streaming PAUSED':'Streaming RESUMED');btnPause.textContent=isPaused?'Resume':'Pause';btnPause.className=isPaused?'paused':'';statusEl.textContent=isPaused?'Paused':'Connected'}).catch(e=>addLog('Pause error: '+e.message))};"
+        "window.setFullScale=(fs,chartScale)=>{fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full_scale:fs})}).then(r=>r.json()).then(d=>{if(d.full_scale!==undefined){currentFullScale=d.full_scale;const labels=['±2g','±4g','±8g','±16g'];addLog('Sensor: '+labels[fs]+', Chart: '+(chartScale===null?'Auto':'±'+chartScale+'g'));for(let i=0;i<4;i++)document.getElementById('fs'+i).className=(i===fs&&chartScale!==null)?'active':'';document.getElementById('fsAuto').className=chartScale===null?'active':'';if(chartScale!==null){chart.options.scales.y.min=-chartScale;chart.options.scales.y.max=chartScale}else{delete chart.options.scales.y.min;delete chart.options.scales.y.max}chart.update()}}).catch(e=>addLog('FS error: '+e.message))};"
+        "const maxPoints=500;const chart=new Chart(document.getElementById('chartG'),{type:'line',data:{labels:[],datasets:[{label:'X',data:[],borderColor:'#ef4444',borderWidth:1.5,pointRadius:0},{label:'Y',data:[],borderColor:'#22c55e',borderWidth:1.5,pointRadius:0},{label:'Z',data:[],borderColor:'#3b82f6',borderWidth:1.5,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{display:false},y:{beginAtZero:false,grid:{color:'rgba(226,232,240,0.8)'}}},plugins:{legend:{labels:{color:'#1e293b'}}}}});"
+        "let sampleIndex=0;function addLog(msg){const t=new Date().toLocaleTimeString();logEl.innerHTML='['+t+'] '+msg+'<br>'+logEl.innerHTML;const parts=logEl.innerHTML.split('<br>');if(parts.length>160)logEl.innerHTML=parts.slice(0,160).join('<br>')}"
+        "function formatNumber(val,digits){if(val===null||val===undefined||!isFinite(val))return'-';return Number(val).toFixed(digits)}"
+        "function pushValues(payload){const chunk=payload&&payload.chunks?payload.chunks:null;if(!chunk||!chunk.x)return;const len=Math.min(chunk.x.length,chunk.y.length,chunk.z.length);for(let i=0;i<len;i++){if(chart.data.labels.length>=maxPoints){chart.data.labels.shift();chart.data.datasets[0].data.shift();chart.data.datasets[1].data.shift();chart.data.datasets[2].data.shift()}chart.data.labels.push(sampleIndex++);chart.data.datasets[0].data.push(chunk.x[i]);chart.data.datasets[1].data.push(chunk.y[i]);chart.data.datasets[2].data.push(chunk.z[i])}chart.update('none');if(payload&&payload.mag!==undefined)metrics.mag.textContent=formatNumber(payload.mag,3)}"
+        "function updateMetrics(payload){const stats=payload&&payload.s?payload.s:{};metrics.msg.textContent=formatNumber(stats.pps!==undefined?stats.pps:stats.mps,0);metrics.samples.textContent=formatNumber(stats.sps,0);if(payload&&payload.mag!==undefined)metrics.mag.textContent=formatNumber(payload.mag,3);statusEl.textContent='Connected — '+formatNumber((stats.pps!==undefined?stats.pps:(stats.mps!==undefined?stats.mps:0)),0)+' Hz'}"
+        "addLog('Waiting for IIS3DWB data...');const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/data';addLog('Connecting to '+wsUrl);const ws=new WebSocket(wsUrl);"
+        "ws.onopen=()=>{addLog('WebSocket connected');statusEl.style.borderLeftColor='#10b981';statusEl.style.background='#fff'};"
+        "ws.onerror=()=>{addLog('WebSocket error');statusEl.textContent='Error';statusEl.style.borderLeftColor='#ef4444'};"
+        "ws.onclose=()=>{addLog('WebSocket closed');statusEl.textContent='Disconnected';statusEl.style.borderLeftColor='#f59e0b'};"
+        "ws.onmessage=(evt)=>{try{const payload=JSON.parse(evt.data);updateMetrics(payload);pushValues(payload)}catch(e){addLog('Parse error: '+e.message)}}"
+        "})();</script></body></html>";
+    
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
 }

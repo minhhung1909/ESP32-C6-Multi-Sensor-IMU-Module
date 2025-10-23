@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IIS3DWB Web Monitor</title>
+    <script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h2>ESP32-C6 IIS3DWB High-Speed Monitor</h2>
+    
+    <div class='status' id='status'>Connecting...</div>
+    
+    <div class='controls'>
+        <div class='control-group'>
+            <h4>Streaming Control</h4>
+            <button id='btnPause' onclick='togglePause()'>Pause</button>
+        </div>
+        <div class='control-group'>
+            <h4>Full Scale Range (Sensor + Chart)</h4>
+            <button id='fs0' onclick='setFullScale(0,2)'>±2g</button>
+            <button id='fs1' onclick='setFullScale(1,4)' class='active'>±4g</button>
+            <button id='fs2' onclick='setFullScale(2,8)'>±8g</button>
+            <button id='fs3' onclick='setFullScale(3,16)'>±16g</button>
+            <button id='fsAuto' onclick='setFullScale(3,null)'>Auto Scale</button>
+        </div>
+    </div>
+    
+    <div class='metrics'>
+        <div class='metric'>
+            <span class='label'>Hz</span>
+            <span class='value' id='metricMsg'>-</span>
+        </div>
+        <div class='metric'>
+            <span class='label'>Sensor samples/s</span>
+            <span class='value' id='metricSamples'>-</span>
+        </div>
+        <div class='metric'>
+            <span class='label'>|g|</span>
+            <span class='value' id='metricMag'>-</span>
+        </div>
+    </div>
+    
+    <div class='chart-box'>
+        <h3>IIS3DWB Acceleration (g)</h3>
+        <canvas id='chartG'></canvas>
+    </div>
+    
+    <h3 style='color:#38bdf8;margin-top:24px;'>Event Log</h3>
+    <div class='log' id='log'></div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
