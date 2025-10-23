@@ -12,7 +12,7 @@
 <body>
   <div class="container">
     <header>
-      <h1>ESP32-C6 IIS3DWB High-Speed Monitor 111 </h1>
+      <h1>ESP32-C6 IIS3DWB High-Speed Monitor</h1>
       <div class="status">
         <span id="connectionStatus">Connecting...</span>
         <span id="deviceIp"></span>
@@ -42,6 +42,7 @@
         <div class="chart-header">
           <h2>IIS3DWB Acceleration (g)</h2>
           <div id="scaleControls" class="scale-controls">
+            <button id="pauseResumeBtn" data-action="pause">Pause</button>
             <button data-scale="auto">Auto</button>
             <button data-scale="2">±2g</button>
             <button data-scale="4">±4g</button>

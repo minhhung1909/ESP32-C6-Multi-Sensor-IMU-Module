@@ -131,6 +131,24 @@ header h1 {
   cursor: wait;
 }
 
+#pauseResumeBtn {
+  margin-right: 8px;
+  background: #10b981 !important;
+  color: white !important;
+}
+
+#pauseResumeBtn:hover {
+  background: #059669 !important;
+}
+
+#pauseResumeBtn.paused {
+  background: #f59e0b !important;
+}
+
+#pauseResumeBtn.paused:hover {
+  background: #d97706 !important;
+}
+
 .chart-container {
   position: relative;
   height: 400px;

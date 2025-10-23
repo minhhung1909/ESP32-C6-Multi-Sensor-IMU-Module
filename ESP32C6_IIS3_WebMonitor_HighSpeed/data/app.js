@@ -1,8 +1,8 @@
 // Chart Configuration
-const maxPoints = 10000;
+const maxPoints = 5000;
 const buffers = { x: [], y: [], z: [] };
 let selectedScale = 'auto';
-let manualScale = 16;
+let manualScale = 2;
 let isPaused = false;
 
 // Metrics elements
@@ -18,8 +18,6 @@ const metrics = {
 const connectionStatus = document.getElementById('connectionStatus');
 const deviceIp = document.getElementById('deviceIp');
 const eventLog = document.getElementById('eventLog');
-const pauseCard = document.getElementById('pauseCard');
-const pauseStatus = document.getElementById('pauseStatus');
 
 // Canvas setup
 const canvas = document.getElementById('accelChart');
@@ -39,16 +37,6 @@ function addLog(message) {
   while (eventLog.children.length > 50) {
     eventLog.removeChild(eventLog.lastChild);
   }
-}
-
-// Pause/Resume control
-if (pauseCard && pauseStatus) {
-  pauseCard.addEventListener('click', () => {
-    isPaused = !isPaused;
-    pauseStatus.textContent = isPaused ? 'Paused' : 'Running';
-    pauseStatus.style.color = isPaused ? '#ef4444' : '#10b981';
-    addLog('Chart ' + (isPaused ? 'paused' : 'resumed'));
-  });
 }
 
 // Canvas resizing
@@ -114,6 +102,8 @@ function drawChart() {
   const width = canvas.clientWidth || canvas.width / dpr;
   const height = canvas.clientHeight || canvas.height / dpr;
   
+  console.log('DEBUG: drawChart called - canvas size:', width, 'x', height, 'buffer lengths:', buffers.x.length, buffers.y.length, buffers.z.length);
+  
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
   
@@ -123,6 +113,8 @@ function drawChart() {
   
   const [minVal, maxVal] = computeRange();
   const span = maxVal - minVal || 1;
+  
+  console.log('DEBUG: Y-axis range:', minVal, 'to', maxVal, 'span:', span);
   
   const colors = { x: '#ef4444', y: '#10b981', z: '#3b82f6' };
   const gridCount = 4;
@@ -175,12 +167,13 @@ function drawChart() {
 
 // Scale controls
 const scaleControls = document.getElementById('scaleControls');
-const scaleButtons = scaleControls ? Array.from(scaleControls.querySelectorAll('button')) : [];
+// Only select buttons that have a data-scale attribute (exclude Pause/Resume button)
+const scaleButtons = scaleControls ? Array.from(scaleControls.querySelectorAll('button[data-scale]')) : [];
 
 function applyScale(mode, opts) {
   const options = opts || {};
-  selectedScale = mode;
   
+  // Validate mode before assigning to selectedScale to avoid invalid states
   if (mode !== 'auto') {
     const parsed = Number(mode);
     if (!Number.isFinite(parsed)) {
@@ -189,17 +182,16 @@ function applyScale(mode, opts) {
     }
     manualScale = parsed;
   }
+  selectedScale = mode;
   
   if (scaleButtons.length) {
     scaleButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.scale === mode));
   }
   
-  if (metrics.fs) {
-    if (mode === 'auto') {
-      metrics.fs.textContent = 'auto';
-    } else {
-      metrics.fs.textContent = '+/-' + manualScale + 'g';
-    }
+  if (mode === 'auto') {
+    metrics.fs.textContent = 'auto';
+  } else {
+    metrics.fs.textContent = '+/-' + manualScale + 'g';
   }
   
   if (!options.silent) {
@@ -251,6 +243,25 @@ if (scaleButtons.length) {
   applyScale('auto', { silent: true });
 }
 
+// Pause/Resume button handler
+const pauseResumeBtn = document.getElementById('pauseResumeBtn');
+if (pauseResumeBtn) {
+  pauseResumeBtn.addEventListener('click', () => {
+    isPaused = !isPaused;
+    
+    if (isPaused) {
+      pauseResumeBtn.textContent = 'Resume';
+      pauseResumeBtn.classList.add('paused');
+      addLog('Chart paused');
+    } else {
+      pauseResumeBtn.textContent = 'Pause';
+      pauseResumeBtn.classList.remove('paused');
+      addLog('Chart resumed');
+      scheduleDraw(); // Resume drawing immediately
+    }
+  });
+}
+
 // Config refresh
 function refreshConfig() {
   fetch('/api/config')
@@ -262,7 +273,7 @@ function refreshConfig() {
       if (cfg && cfg.imu_full_scale_g) {
         const fsVal = String(cfg.imu_full_scale_g);
         if (selectedScale === 'auto') {
-          if (metrics.fs) metrics.fs.textContent = '+/-' + fsVal + 'g';
+          metrics.fs.textContent = '+/-' + fsVal + 'g';
         } else {
           applyScale(fsVal, { silent: true });
         }
@@ -277,11 +288,18 @@ refreshConfig();
 
 // Data processing
 function pushValues(payload) {
-  if (!payload || !payload.chunks) return;
+  if (!payload || !payload.chunks) {
+    console.log('DEBUG: No payload or chunks', payload);
+    return;
+  }
   
   // Update metrics even when paused
-  if (payload.mag !== undefined && metrics.mag) {
+  if (payload.mag !== undefined) {
     metrics.mag.textContent = formatNumber(payload.mag, 3);
+  }
+  
+  if (payload.fs !== undefined && selectedScale === 'auto') {
+    metrics.fs.textContent = '+/-' + payload.fs + 'g';
   }
   
   if (payload.s) {
@@ -292,8 +310,11 @@ function pushValues(payload) {
     if (s.batch !== undefined && metrics.batch) metrics.batch.textContent = s.batch;
   }
   
-  // Skip chart update if paused
-  if (isPaused) return;
+  // Skip adding data to buffers if paused
+  if (isPaused) {
+    console.log('DEBUG: Chart paused, skipping data');
+    return;
+  }
   
   const chunk = payload.chunks;
   const xs = Array.isArray(chunk.x) ? chunk.x : [];
@@ -301,7 +322,12 @@ function pushValues(payload) {
   const zs = Array.isArray(chunk.z) ? chunk.z : [];
   
   const len = Math.min(xs.length, ys.length, zs.length);
-  if (!len) return;
+  console.log('DEBUG: Received chunk data - x:', xs.length, 'y:', ys.length, 'z:', zs.length, 'min:', len);
+  
+  if (!len) {
+    console.log('DEBUG: No data in chunks');
+    return;
+  }
   
   for (let i = 0; i < len; i++) {
     if (buffers.x.length >= maxPoints) {
@@ -315,6 +341,7 @@ function pushValues(payload) {
     buffers.z.push(Number(zs[i]));
   }
   
+  console.log('DEBUG: Buffer sizes after push - x:', buffers.x.length, 'y:', buffers.y.length, 'z:', buffers.z.length);
   scheduleDraw();
 }
 
@@ -356,10 +383,13 @@ function connectWebSocket(ip) {
   
   ws.onmessage = (event) => {
     try {
+      console.log('DEBUG: WebSocket message received, length:', event.data.length);
       const data = JSON.parse(event.data);
+      console.log('DEBUG: Parsed JSON data:', data);
       pushValues(data);
     } catch (err) {
       addLog('Parse error: ' + err.message);
+      console.error('DEBUG: Parse error:', err, 'Raw data:', event.data);
     }
   };
   
@@ -384,3 +414,42 @@ function connectWebSocket(ip) {
 // Initialize
 addLog('Waiting for IIS3DWB data...');
 getDeviceIp().then(ip => connectWebSocket(ip));
+
+// Debug helpers - accessible from browser console
+window.debugChart = {
+  getBuffers: () => ({
+    x: buffers.x.slice(0, 10), // First 10 samples
+    y: buffers.y.slice(0, 10),
+    z: buffers.z.slice(0, 10),
+    lengths: { x: buffers.x.length, y: buffers.y.length, z: buffers.z.length }
+  }),
+  forceRedraw: () => {
+    console.log('Forcing redraw...');
+    drawChart();
+  },
+  injectTestData: () => {
+    console.log('Injecting test data...');
+    for (let i = 0; i < 100; i++) {
+      buffers.x.push(Math.sin(i * 0.1));
+      buffers.y.push(Math.cos(i * 0.1));
+      buffers.z.push(Math.sin(i * 0.05) * 0.5);
+    }
+    console.log('Test data injected. Buffer lengths:', buffers.x.length);
+    scheduleDraw();
+  },
+  clearBuffers: () => {
+    buffers.x = [];
+    buffers.y = [];
+    buffers.z = [];
+    console.log('Buffers cleared');
+    scheduleDraw();
+  },
+  isPaused: () => isPaused,
+  togglePause: () => {
+    isPaused = !isPaused;
+    console.log('isPaused:', isPaused);
+  }
+};
+
+console.log('DEBUG: Debug helpers loaded. Use window.debugChart in console.');
+console.log('Available commands: getBuffers(), forceRedraw(), injectTestData(), clearBuffers(), isPaused(), togglePause()');

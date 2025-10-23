@@ -18,7 +18,7 @@ static httpd_handle_t server = NULL;
 static httpd_handle_t ws_server = NULL;
 
 #define WS_PLOT_CHUNK_SAMPLES      100
-#define WS_PLOT_BUFFER_CAPACITY    10000
+#define WS_PLOT_BUFFER_CAPACITY    5000
 #define WS_RECENT_MAX_SAMPLES      IMU_MANAGER_MAX_SAMPLES
 
 // WebSocket connection tracking
